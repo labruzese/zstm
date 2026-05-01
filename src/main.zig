@@ -1,71 +1,58 @@
 const std = @import("std");
-const Io = std.Io;
-
 const zstm = @import("zstm");
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    const gpa = init.gpa;
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
+    var stm: zstm.Stm = .init;
+    var counter: zstm.TxVar = .init(0);
 
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
-    }
+    const num_threads = 8;
+    const per_thread: usize = 50_000;
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
+    const Worker = struct {
+        fn run(stm_ptr: *zstm.Stm, c: *zstm.TxVar, n: usize, allocator: std.mem.Allocator) void {
+            var tx: zstm.Tx = .init(allocator, stm_ptr, .ala);
+            defer tx.deinit();
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+            const Body = struct {
+                fn run(t: *zstm.Tx, addr: *zstm.TxVar) zstm.Error!void {
+                    const v = try t.read(addr);
+                    try t.write(addr, v + 1);
+                }
+            };
 
-    try zstm.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
-}
-
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                tx.run(Body.run, .{c}) catch |err| {
+                    std.debug.panic("transaction failed: {}", .{err});
+                };
+            }
+        }
     };
+
+    var threads: [num_threads]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{ &stm, &counter, per_thread, gpa });
+    }
+    for (threads) |t| t.join();
+
+    const final = counter.unsafeLoad();
+    const expected: usize = num_threads * per_thread;
+
+    var stdout_buffer: [256]u8 = undefined;
+    var stdout_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
+    const out = &stdout_writer.interface;
+
+    try out.print(
+        "zstm demo: {d} threads x {d} txns -> counter = {d} (expected {d})\n",
+        .{ num_threads, per_thread, final, expected },
+    );
+    try out.print("seq_lock = {d} (expected {d})\n", .{
+        stm.seq_lock.load(.acquire),
+        2 * expected,
+    });
+    try out.flush();
+
+    if (final != expected) std.process.exit(1);
 }
