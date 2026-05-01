@@ -10,8 +10,6 @@
 //!   2. A redo log 
 //!   3. Value-based validation 
 //!
-//! NOrec works well for 
-//!
 //! Properties this implementation provides:
 //!
 //!   - **Livelock freedom.**
@@ -61,10 +59,10 @@ pub const Word = usize;
 /// guarantees. Use `Tx.read` / `Tx.write` for transactional access. The
 /// `unsafeLoad` / `unsafeStore` helpers are for one-off, lock-free reads or
 /// initialization while the variable is provably private.
-pub const TxVar = extern struct {
+pub const TxWord = extern struct {
     raw: Word,
 
-    pub fn init(value: Word) TxVar {
+    pub fn init(value: Word) TxWord {
         return .{ .raw = value };
     }
 
@@ -73,15 +71,72 @@ pub const TxVar = extern struct {
     /// final result). Does NOT participate in the STM and offers no
     /// consistency with concurrent transactions; only use this when no
     /// transactions are active or when you understand the racy semantics.
-    pub fn unsafeLoad(self: *const TxVar) Word {
+    pub fn unsafeLoad(self: *const TxWord) Word {
         return @atomicLoad(Word, &self.raw, .monotonic);
     }
 
     /// Single relaxed atomic store. Same caveats as `unsafeLoad`.
-    pub fn unsafeStore(self: *TxVar, value: Word) void {
+    pub fn unsafeStore(self: *TxWord, value: Word) void {
         @atomicStore(Word, &self.raw, value, .monotonic);
     }
 };
+
+/// A transactional cell that wraps any arbitrary type `T` into a sequence of
+/// `Word`-sized `TxVar`s. Provides type-safe access through `Tx.readCell`
+/// and `Tx.writeCell`.
+pub fn TxCell(comptime T: type) type {
+    const word_count = (@sizeOf(T) + @sizeOf(Word) - 1) / @sizeOf(Word);
+
+    return extern struct {
+        pub const Payload = T;
+        pub const NumWords = word_count;
+
+        words: [word_count]TxWord,
+
+        pub fn init(value: T) @This() {
+            var self: @This() = undefined;
+            var words_copy = [_]Word{0} ** word_count;
+            
+            const value_bytes = std.mem.asBytes(&value);
+            const words_bytes = std.mem.sliceAsBytes(&words_copy);
+            @memcpy(words_bytes[0..value_bytes.len], value_bytes);
+
+            for (&self.words, 0..) |*w, i| {
+                w.* = TxWord.init(words_copy[i]);
+            }
+            return self;
+        }
+
+        /// Non-transactional load. 
+        /// **Warning for multi-word types:** This is NOT atomic across the 
+        /// entire struct. It reads word-by-word, so concurrent writers could 
+        /// result in a torn read (half old state, half new state).
+        /// See `TxWord.unsafeLoad`
+        pub fn unsafeLoad(self: *const @This()) T {
+            var words_copy: [word_count]Word = undefined;
+            for (&self.words, 0..) |*w, i| {
+                words_copy[i] = w.unsafeLoad();
+            }
+            var result: T = undefined;
+            const result_bytes = std.mem.asBytes(&result);
+            const words_bytes = std.mem.sliceAsBytes(&words_copy);
+            @memcpy(result_bytes, words_bytes[0..result_bytes.len]);
+            return result;
+        }
+
+        /// Non-transactional store. Same tearing caveats as `unsafeLoad`.
+        pub fn unsafeStore(self: *@This(), value: T) void {
+            var words_copy = [_]Word{0} ** word_count;
+            const value_bytes = std.mem.asBytes(&value);
+            const words_bytes = std.mem.sliceAsBytes(&words_copy);
+            @memcpy(words_bytes[0..value_bytes.len], value_bytes);
+
+            for (&self.words, 0..) |*w, i| {
+                w.unsafeStore(words_copy[i]);
+            }
+        }
+    };
+}
 
 /// Errors that may flow out of a transactional operation.
 ///
@@ -97,9 +152,6 @@ pub const Error = Allocator.Error || error{TxRetry};
 
 /// Globally shared STM state. Typically a program has exactly one of these.
 /// All `Tx` instances created against this `Stm` coordinate through it.
-///
-/// The sequence lock is given its own cache line so that the heavy
-/// read-modify-write traffic on it does not false-share with adjacent globals.
 pub const Stm = struct {
     /// The single global sequence lock. Even values mean unheld; odd values
     /// mean a writer is mid-commit. Each successful writer commit moves the
@@ -111,17 +163,15 @@ pub const Stm = struct {
     pub const init: Stm = .{ .seq_lock = .init(0) };
 };
 
-/// A single read-log entry: the address that was read and the value seen.
 const ReadLogEntry = struct {
-    addr: *const TxVar,
+    addr: *const TxWord,
     val: Word,
 };
 
 /// A transaction context. One per thread.
 ///
 /// `Tx` carries the thread-local state of an in-flight (or about-to-start)
-/// transaction: the snapshot of the global sequence lock at begin time, the
-/// append-only read log, and the indexed write set.
+/// transaction.
 ///
 /// ```zig
 /// var tx: Tx = .init(gpa, &stm, .ala);
@@ -270,7 +320,7 @@ pub const Tx = struct {
         // odd-value check.
         var it = self.writes.iterator();
         while (it.next()) |entry| {
-            const target: *TxVar = @ptrFromInt(entry.key_ptr.*);
+            const target: *TxWord = @ptrFromInt(entry.key_ptr.*);
             @atomicStore(Word, &target.raw, entry.value_ptr.*, .monotonic);
         }
 
@@ -298,7 +348,7 @@ pub const Tx = struct {
     ///   3. If our snapshot is stale (a writer committed since we began),
     ///      validate; on success update the snapshot and re-read.
     ///   4. Log the (addr, value) pair for future validation.
-    pub fn read(self: *Tx, addr: *const TxVar) Error!Word {
+    pub fn read(self: *Tx, addr: *const TxWord) Error!Word {
         // Read-after-write hazard: returning the buffered value preserves
         // the illusion that the transaction's writes have already happened.
         const key: usize = @intFromPtr(addr);
@@ -320,13 +370,47 @@ pub const Tx = struct {
 
     /// Transactional write. The new value is buffered in the redo log; the
     /// underlying memory is not touched until commit.
-    pub fn write(self: *Tx, addr: *TxVar, val: Word) Error!void {
+    pub fn write(self: *Tx, addr: *TxWord, val: Word) Error!void {
         try self.writes.put(self.allocator, @intFromPtr(addr), val);
     }
 
-    // -------------------------------------------------------------------------
-    // Validation
-    // -------------------------------------------------------------------------
+    /// Type-safe read of a multi-word `TxCell`. 
+    /// Returns `error.TxRetry` if validation fails mid-read.
+    pub fn readCell(self: *Tx, cell: anytype) Error!std.meta.Child(@TypeOf(cell)).Payload {
+        const CellType = std.meta.Child(@TypeOf(cell));
+        const T = CellType.Payload;
+        var words_copy: [CellType.NumWords]Word = undefined;
+
+        // NOrec ensures this loop is safe: if a writer commits while we are 
+        // partway through reading these words, `self.read` will detect the 
+        // global lock advancement, re-validate, and throw TxRetry.
+        for (&cell.words, 0..) |*w, i| {
+            words_copy[i] = try self.read(w);
+        }
+
+        var result: T = undefined;
+        const result_bytes = std.mem.asBytes(&result);
+        const words_bytes = std.mem.sliceAsBytes(&words_copy);
+        @memcpy(result_bytes, words_bytes[0..result_bytes.len]);
+        return result;
+    }
+
+    /// Type-safe write to a multi-word `TxCell`.
+    /// Buffers the new struct state in the redo log.
+    pub fn writeCell(self: *Tx, cell: anytype, value: anytype) Error!void {
+        const CellType = std.meta.Child(@TypeOf(cell));
+        const T = CellType.Payload;
+        if (@TypeOf(value) != T) @compileError("type mismatch in writeCell");
+
+        var words_copy = [_]Word{0} ** CellType.NumWords;
+        const value_bytes = std.mem.asBytes(&value);
+        const words_bytes = std.mem.sliceAsBytes(&words_copy);
+        @memcpy(words_bytes[0..value_bytes.len], value_bytes);
+
+        for (&cell.words, 0..) |*w, i| {
+            try self.write(w, words_copy[i]);
+        }
+    }
 
     /// Run a consistent-snapshot validation of the read log. Returns the
     /// timestamp at which validation succeeded (suitable as the new snapshot)
@@ -359,10 +443,6 @@ pub const Tx = struct {
     }
 };
 
-// =============================================================================
-// Compile-time helpers for `Tx.run`
-// =============================================================================
-
 /// Extract the return type of `body` (which is `Error!T` for some `T`) from a
 /// runtime point of view, so that `run` can be declared returning the same
 /// type.
@@ -393,13 +473,13 @@ test "single-threaded read/write produces correct value" {
     const allocator = std.testing.allocator;
 
     var stm: Stm = .init;
-    var x: TxVar = .init(0);
+    var x: TxWord = .init(0);
 
     var tx: Tx = .init(allocator, &stm, .ala);
     defer tx.deinit();
 
     const Body = struct {
-        fn run(t: *Tx, addr: *TxVar) Error!Word {
+        fn run(t: *Tx, addr: *TxWord) Error!Word {
             const v = try t.read(addr);
             try t.write(addr, v + 1);
             return v;
@@ -418,13 +498,13 @@ test "read-after-write returns buffered value" {
     const allocator = std.testing.allocator;
 
     var stm: Stm = .init;
-    var x: TxVar = .init(7);
+    var x: TxWord = .init(7);
 
     var tx: Tx = .init(allocator, &stm, .ala);
     defer tx.deinit();
 
     const Body = struct {
-        fn run(t: *Tx, addr: *TxVar) Error!Word {
+        fn run(t: *Tx, addr: *TxWord) Error!Word {
             const before = try t.read(addr);
             try t.write(addr, before + 100);
             // Within the same transaction, the read should see the buffered
@@ -444,7 +524,7 @@ test "read-only transaction commits without acquiring lock (ALA)" {
     const allocator = std.testing.allocator;
 
     var stm: Stm = .init;
-    var x: TxVar = .init(42);
+    var x: TxWord = .init(42);
 
     var tx: Tx = .init(allocator, &stm, .ala);
     defer tx.deinit();
@@ -452,7 +532,7 @@ test "read-only transaction commits without acquiring lock (ALA)" {
     const initial_lock = stm.seq_lock.load(.acquire);
 
     const Body = struct {
-        fn run(t: *Tx, addr: *TxVar) Error!Word {
+        fn run(t: *Tx, addr: *TxWord) Error!Word {
             return try t.read(addr);
         }
     };
@@ -467,7 +547,7 @@ test "writer commit advances seq_lock by exactly 2" {
     const allocator = std.testing.allocator;
 
     var stm: Stm = .init;
-    var x: TxVar = .init(0);
+    var x: TxWord = .init(0);
 
     var tx: Tx = .init(allocator, &stm, .ala);
     defer tx.deinit();
@@ -475,7 +555,7 @@ test "writer commit advances seq_lock by exactly 2" {
     const before = stm.seq_lock.load(.acquire);
 
     const Body = struct {
-        fn run(t: *Tx, addr: *TxVar) Error!void {
+        fn run(t: *Tx, addr: *TxWord) Error!void {
             try t.write(addr, 1);
         }
     };
@@ -491,7 +571,7 @@ test "manually-thrown TxRetry causes retry then succeeds" {
     const allocator = std.testing.allocator;
 
     var stm: Stm = .init;
-    var x: TxVar = .init(0);
+    var x: TxWord = .init(0);
 
     var tx: Tx = .init(allocator, &stm, .ala);
     defer tx.deinit();
@@ -499,7 +579,7 @@ test "manually-thrown TxRetry causes retry then succeeds" {
     var attempts: u32 = 0;
 
     const Body = struct {
-        fn run(t: *Tx, addr: *TxVar, attempts_ptr: *u32) Error!Word {
+        fn run(t: *Tx, addr: *TxWord, attempts_ptr: *u32) Error!Word {
             attempts_ptr.* += 1;
             const v = try t.read(addr);
             if (attempts_ptr.* < 3) return error.TxRetry;
@@ -518,7 +598,7 @@ test "non-retry error from body propagates" {
     const allocator = std.testing.allocator;
 
     var stm: Stm = .init;
-    var x: TxVar = .init(0);
+    var x: TxWord = .init(0);
 
     var tx: Tx = .init(allocator, &stm, .ala);
     defer tx.deinit();
@@ -526,7 +606,7 @@ test "non-retry error from body propagates" {
     const MyErr = error{Boom} || Error;
 
     const Body = struct {
-        fn run(t: *Tx, addr: *TxVar) MyErr!void {
+        fn run(t: *Tx, addr: *TxWord) MyErr!void {
             _ = try t.read(addr);
             return error.Boom;
         }
@@ -543,18 +623,18 @@ test "concurrent increments converge to the correct count" {
     const allocator = std.testing.allocator;
 
     var stm: Stm = .init;
-    var counter: TxVar = .init(0);
+    var counter: TxWord = .init(0);
 
     const num_threads = 4;
     const per_thread = 2_000;
 
     const Worker = struct {
-        fn run(stm_ptr: *Stm, c: *TxVar, n: usize, gpa: Allocator) void {
+        fn run(stm_ptr: *Stm, c: *TxWord, n: usize, gpa: Allocator) void {
             var tx: Tx = .init(gpa, stm_ptr, .ala);
             defer tx.deinit();
 
             const Body = struct {
-                fn run(t: *Tx, addr: *TxVar) Error!void {
+                fn run(t: *Tx, addr: *TxWord) Error!void {
                     const v = try t.read(addr);
                     try t.write(addr, v + 1);
                 }
@@ -588,8 +668,8 @@ test "concurrent two-variable swap maintains sum invariant" {
 
     var stm: Stm = .init;
     // Invariant: a + b == 1000 always.
-    var a: TxVar = .init(500);
-    var b: TxVar = .init(500);
+    var a: TxWord = .init(500);
+    var b: TxWord = .init(500);
 
     const num_threads = 4;
     const per_thread = 1_000;
@@ -597,8 +677,8 @@ test "concurrent two-variable swap maintains sum invariant" {
     const Worker = struct {
         fn run(
             stm_ptr: *Stm,
-            ax: *TxVar,
-            bx: *TxVar,
+            ax: *TxWord,
+            bx: *TxWord,
             n: usize,
             seed: u64,
             gpa: Allocator,
@@ -610,7 +690,7 @@ test "concurrent two-variable swap maintains sum invariant" {
             const rand = prng.random();
 
             const Body = struct {
-                fn run(t: *Tx, av: *TxVar, bv: *TxVar, amount: Word) Error!void {
+                fn run(t: *Tx, av: *TxWord, bv: *TxWord, amount: Word) Error!void {
                     const av_old = try t.read(av);
                     const bv_old = try t.read(bv);
                     try t.write(av, av_old -% amount);
@@ -641,7 +721,7 @@ test "concurrent two-variable swap maintains sum invariant" {
     defer checker.deinit();
 
     const Read = struct {
-        fn run(t: *Tx, av: *TxVar, bv: *TxVar) Error![2]Word {
+        fn run(t: *Tx, av: *TxWord, bv: *TxWord) Error![2]Word {
             return .{ try t.read(av), try t.read(bv) };
         }
     };
@@ -656,7 +736,7 @@ test "SLA mode also commits read-only with sequence lock unchanged" {
     const allocator = std.testing.allocator;
 
     var stm: Stm = .init;
-    var x: TxVar = .init(99);
+    var x: TxWord = .init(99);
 
     var tx: Tx = .init(allocator, &stm, .sla);
     defer tx.deinit();
@@ -664,7 +744,7 @@ test "SLA mode also commits read-only with sequence lock unchanged" {
     const before = stm.seq_lock.load(.acquire);
 
     const Body = struct {
-        fn run(t: *Tx, addr: *TxVar) Error!Word {
+        fn run(t: *Tx, addr: *TxWord) Error!Word {
             return try t.read(addr);
         }
     };
