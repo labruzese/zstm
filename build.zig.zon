@@ -1,8 +1,8 @@
 .{
     .name = .zstm,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0xb21e8faa9904f1d,
-    .minimum_zig_version = "0.17.0-dev.93+76174e1bc",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",

@@ -5,18 +5,18 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     var stm: zstm.Stm = .init;
-    var counter: zstm.TxVar = .init(0);
+    var counter: zstm.TxWord = .init(0);
 
     const num_threads = 8;
     const per_thread: usize = 50_000;
 
     const Worker = struct {
-        fn run(stm_ptr: *zstm.Stm, c: *zstm.TxVar, n: usize, allocator: std.mem.Allocator) void {
+        fn run(stm_ptr: *zstm.Stm, c: *zstm.TxWord, n: usize, allocator: std.mem.Allocator) void {
             var tx: zstm.Tx = .init(allocator, stm_ptr, .ala);
             defer tx.deinit();
 
             const Body = struct {
-                fn run(t: *zstm.Tx, addr: *zstm.TxVar) zstm.Error!void {
+                fn run(t: *zstm.Tx, addr: *zstm.TxWord) zstm.Error!void {
                     const v = try t.read(addr);
                     try t.write(addr, v + 1);
                 }

@@ -14,7 +14,7 @@
 //!
 //!   - **Livelock freedom.**
 //!   - **Privatization safety.**
-//!   - **Publication safety (ALA by default, SLA on request).** SLA requires 
+//!   - **Publication safety (ALA by default, optional SLA).** SLA requires 
 //!     one extra validation at commit time and is selectable via `Tx.Mode`.
 //!   - **Opacity.** A doomed transaction never observes inconsistent state.
 //!
@@ -29,7 +29,7 @@
 //!
 //! ```zig
 //! var stm: zstm.Stm = .init;
-//! var counter: zstm.TxVar = .init(0);
+//! var counter: zstm.TxWord = .init(0);
 //!
 //! var tx: zstm.Tx = .init(allocator, &stm, .ala);
 //! defer tx.deinit();
@@ -153,13 +153,13 @@ pub const Error = Allocator.Error || error{TxRetry};
 /// Globally shared STM state. Typically a program has exactly one of these.
 /// All `Tx` instances created against this `Stm` coordinate through it.
 pub const Stm = struct {
-    /// The single global sequence lock. Even values mean unheld; odd values
-    /// mean a writer is mid-commit. Each successful writer commit moves the
-    /// counter forward by exactly 2, so an even snapshot at one point in time
-    /// uniquely identifies the state of all transactionally-protected memory.
+    /// Even values mean unheld; odd values mean a writer is mid-commit. Each
+    /// successful writer commit moves the counter forward by exactly 2, so an 
+    /// even snapshot at one point in time uniquely identifies the state of 
+    /// all transactionally-protected memory.
     seq_lock: std.atomic.Value(u64) align(std.atomic.cache_line),
 
-    /// Default-initialized `Stm` ready for use.
+    /// Default `Stm`.
     pub const init: Stm = .{ .seq_lock = .init(0) };
 };
 
@@ -185,8 +185,7 @@ pub const Tx = struct {
     allocator: Allocator,
 
     /// Snapshot of `stm.seq_lock` at the most recent point at which the
-    /// transaction was known to be consistent. Updated by `txBegin` and by
-    /// each successful `validate`.
+    /// transaction was known to be consistent.
     snapshot: u64 = 0,
 
     /// Append-only read log. Validation re-reads in order and checks for the
@@ -246,7 +245,6 @@ pub const Tx = struct {
     /// because the body may run multiple times, such effects will repeat.
     pub fn run(self: *Tx, comptime body: anytype, args: anytype) RunReturn(@TypeOf(body)) {
         const Ret = RunReturn(@TypeOf(body));
-        // Compile-time sanity check on the function shape.
         comptime checkBody(@TypeOf(body));
 
         retry: while (true) {
@@ -295,7 +293,7 @@ pub const Tx = struct {
         if (self.writes.count() == 0) {
             if (self.sla) {
                 // SLA: validate once even on read-only, so that empty/read-only
-                // transactions can serve as publication points (paper §3.3).
+                // transactions can serve as publication points.
                 _ = try self.validate();
             }
             return;
@@ -342,23 +340,23 @@ pub const Tx = struct {
 
     /// Transactional read. Returns `error.TxRetry` if validation fails.
     ///
-    /// The implementation matches Listing 4 of the paper:
-    ///   1. Check the write set first to satisfy read-after-write.
-    ///   2. Read the location.
-    ///   3. If our snapshot is stale (a writer committed since we began),
-    ///      validate; on success update the snapshot and re-read.
-    ///   4. Log the (addr, value) pair for future validation.
     pub fn read(self: *Tx, addr: *const TxWord) Error!Word {
-        // Read-after-write hazard: returning the buffered value preserves
-        // the illusion that the transaction's writes have already happened.
+        //   1. Check the write set first to satisfy read-after-write.
+        //   2. Read the location.
+        //   3. If our snapshot is stale (a writer committed since we began),
+        //      validate; on success update the snapshot and re-read.
+        //   4. Log the (addr, value) pair for future validation.
+
+        // preserve the illusion that the transaction's writes have already 
+        // happened.
         const key: usize = @intFromPtr(addr);
         if (self.writes.get(key)) |buffered| return buffered;
 
         var val = @atomicLoad(Word, &addr.raw, .monotonic);
 
-        // Post-validation. If the global lock has advanced, we may have read
-        // a value that is inconsistent with our earlier reads; re-validate
-        // and re-read until we get a consistent value or abort.
+        // If the global lock has advanced, we may have read a value that is 
+        // inconsistent with our earlier reads; re-validate and re-read 
+        // until we get a consistent value or abort.
         while (self.snapshot != self.stm.seq_lock.load(.acquire)) {
             self.snapshot = try self.validate();
             val = @atomicLoad(Word, &addr.raw, .monotonic);
@@ -368,8 +366,7 @@ pub const Tx = struct {
         return val;
     }
 
-    /// Transactional write. The new value is buffered in the redo log; the
-    /// underlying memory is not touched until commit.
+    /// Transactional write. the underlying memory is not touched until commit.
     pub fn write(self: *Tx, addr: *TxWord, val: Word) Error!void {
         try self.writes.put(self.allocator, @intFromPtr(addr), val);
     }
@@ -381,9 +378,9 @@ pub const Tx = struct {
         const T = CellType.Payload;
         var words_copy: [CellType.NumWords]Word = undefined;
 
-        // NOrec ensures this loop is safe: if a writer commits while we are 
-        // partway through reading these words, `self.read` will detect the 
-        // global lock advancement, re-validate, and throw TxRetry.
+        // if a writer commits while we are partway through reading these words,
+        // `self.read` will detect the global lock advancement, re-validate, 
+        // and throw TxRetry.
         for (&cell.words, 0..) |*w, i| {
             words_copy[i] = try self.read(w);
         }
@@ -438,7 +435,7 @@ pub const Tx = struct {
             if (self.stm.seq_lock.load(.acquire) == time) return time;
 
             // Otherwise a writer slipped in; restart the scan with the newer
-            // snapshot. (Paper Listing 2 lines 10–11.)
+            // snapshot. 
         }
     }
 };
@@ -451,12 +448,12 @@ fn RunReturn(comptime BodyFn: type) type {
     return fn_info.return_type orelse @compileError("transaction body must be a non-generic function");
 }
 
-/// Compile-time sanity check on the shape of a transaction body.
+/// Compile-time check on the shape of a transaction body.
 fn checkBody(comptime BodyFn: type) void {
     const fn_info = @typeInfo(BodyFn).@"fn";
     if (fn_info.params.len < 1)
         @compileError("transaction body must take *Tx as its first argument");
-    const first = fn_info.params[0].type orelse return; // anytype: trust the user
+    const first = fn_info.params[0].type orelse return; 
     if (first != *Tx)
         @compileError("transaction body's first argument must be *Tx, got " ++ @typeName(first));
     const ret = fn_info.return_type orelse return;
