@@ -168,6 +168,232 @@ const ReadLogEntry = struct {
     val: Word,
 };
 
+/// Buffered write set: a dense entry list plus a version-stamped open-addressed
+/// index into it.
+///
+/// Occupancy in the index is encoded as `slot.version == self.version` rather
+/// than in separate metadata. Clearing is therefore a single increment of
+/// `version` -- every slot becomes logically empty at once -- so `reset` is
+/// O(1) no matter how much capacity is reserved.
+///
+/// Entries live in `list`, densely packed in insertion order, so commit-time
+/// writeback is a linear scan over exactly the live entries. The index stores
+/// *indices* into `list`, never pointers, so growing `list` cannot invalidate it.
+///
+/// Small write sets skip the index entirely (`linear_threshold`): probing a
+/// handful of entries linearly beats hashing.
+///
+/// Private to one `Tx`, so nothing here needs atomics.
+pub const WriteSet = struct {
+    pub const Entry = struct {
+        addr: *TxWord,
+        val: Word,
+    };
+
+    const Slot = struct {
+        /// Occupied iff equal to the owning WriteSet's `version`.
+        version: u64 = 0,
+        addr: usize = 0,
+        idx: u32 = 0,
+    };
+
+    /// Below this many entries we linear-scan and never touch the index.
+    const linear_threshold = 8;
+    const min_index_bits: u6 = 5;
+
+    list: []Entry = &.{},
+    len: usize = 0,
+
+    index: []Slot = &.{},
+    index_bits: u6 = 0,
+    /// True once the index is populated for the current transaction.
+    indexed: bool = false,
+
+    /// Bumped by `reset` and by `reindex`; never 0 while in use.
+    version: u64 = 1,
+
+    pub const empty: WriteSet = .{};
+
+    pub fn count(self: *const WriteSet) usize {
+        return self.len;
+    }
+
+    /// Live entries in insertion order. Commit iterates this.
+    pub fn items(self: *const WriteSet) []const Entry {
+        return self.list[0..self.len];
+    }
+
+    pub fn deinit(self: *WriteSet, gpa: Allocator) void {
+        if (self.list.len != 0) gpa.free(self.list);
+        if (self.index.len != 0) gpa.free(self.index);
+        self.* = undefined;
+    }
+
+    pub fn reset(self: *WriteSet) void {
+        self.len = 0;
+        self.indexed = false;
+        self.bumpEpoch();
+    }
+
+    fn bumpEpoch(self: *WriteSet) void {
+        self.version +%= 1;
+        // This is technically required for soundness but 2^64 is absurd
+        // if (self.version == 0) {
+        //     // Wrapped after 2^64 epochs; stale stamps could now alias the live
+        //     // version, so clear for real and restart.
+        //     @memset(self.index, Slot{});
+        //     self.version = 1;
+        // }
+    }
+
+    fn mask(self: *const WriteSet) usize {
+        return (@as(usize, 1) << self.index_bits) - 1;
+    }
+
+    /// Fibonacci hashing over the significant address bits.
+    ///
+    /// TxWord is word-aligned, so the low 3 bits are always zero -- keeping them
+    /// would leave 7/8 of the table unreachable. We take the *high* bits of the
+    /// product, where multiplicative hashing concentrates entropy.
+    fn hash(self: *const WriteSet, key: usize) usize {
+        const mixed: u64 = @as(u64, key >> 3) *% 0x9E3779B97F4A7C15;
+        const shift: u6 = @intCast(64 - @as(u7, self.index_bits));
+        return @intCast(mixed >> shift);
+    }
+
+    pub fn find(self: *const WriteSet, addr: *const TxWord) ?Word {
+        const key = @intFromPtr(addr);
+
+        if (!self.indexed) {
+            for (self.list[0..self.len]) |e| {
+                if (@intFromPtr(e.addr) == key) return e.val;
+            }
+            return null;
+        }
+
+        var h = self.hash(key);
+        while (self.index[h].version == self.version) {
+            const slot = self.index[h];
+            if (slot.addr == key) return self.list[slot.idx].val;
+            h = (h + 1) & self.mask();
+        }
+        return null;
+    }
+
+    pub fn insert(
+        self: *WriteSet,
+        gpa: Allocator,
+        addr: *TxWord,
+        val: Word,
+    ) Allocator.Error!void {
+        const key = @intFromPtr(addr);
+
+        if (!self.indexed) {
+            for (self.list[0..self.len]) |*e| {
+                if (@intFromPtr(e.addr) == key) {
+                    e.val = val; // coalesce: last write wins
+                    return;
+                }
+            }
+            try self.append(gpa, addr, val);
+            if (self.len >= linear_threshold) try self.reindex(gpa);
+            return;
+        }
+
+        var h = self.hash(key);
+        while (self.index[h].version == self.version) {
+            if (self.index[h].addr == key) {
+                self.list[self.index[h].idx].val = val;
+                return;
+            }
+            h = (h + 1) & self.mask();
+        }
+
+        try self.append(gpa, addr, val);
+        // `append` may have reallocated `list`; the index holds indices, not
+        // pointers, so existing stamps remain valid.
+        self.index[h] = .{
+            .version = self.version,
+            .addr = key,
+            .idx = @intCast(self.len - 1),
+        };
+
+        // Keep load factor under 1/4 so probe chains stay short.
+        if (self.len * 4 >= (@as(usize, 1) << self.index_bits)) try self.reindex(gpa);
+    }
+
+    fn append(
+        self: *WriteSet,
+        gpa: Allocator,
+        addr: *TxWord,
+        val: Word,
+    ) Allocator.Error!void {
+        if (self.len == self.list.len) {
+            try self.growList(gpa, if (self.list.len == 0) 16 else self.list.len * 2);
+        }
+        self.list[self.len] = .{ .addr = addr, .val = val };
+        self.len += 1;
+    }
+
+    fn growList(self: *WriteSet, gpa: Allocator, new_cap: usize) Allocator.Error!void {
+        const new = try gpa.alloc(Entry, new_cap);
+        @memcpy(new[0..self.len], self.list[0..self.len]);
+        if (self.list.len != 0) gpa.free(self.list);
+        self.list = new;
+    }
+
+    /// Size the index for the current entry count and rebuild it from `list`.
+    /// Runs when the linear fast path overflows and when load factor is hit.
+    fn reindex(self: *WriteSet, gpa: Allocator) Allocator.Error!void {
+        var bits: u6 = min_index_bits;
+        while ((@as(usize, 1) << bits) < self.len * 4) bits += 1;
+        const needed = @as(usize, 1) << bits;
+
+        if (self.index.len < needed) {
+            if (self.index.len != 0) gpa.free(self.index);
+            self.index = try gpa.alloc(Slot, needed);
+            @memset(self.index, Slot{}); // fresh memory is garbage; stamp stale once
+            self.index_bits = bits;
+        } else {
+            // Reuse the existing (possibly larger) table at its full size.
+            self.index_bits = @intCast(std.math.log2_int(usize, self.index.len));
+        }
+
+        // Slots stamped earlier in *this* transaction must be invalidated before
+        // re-stamping, so take a fresh epoch. `version` is just an epoch tag, 
+        // there is no invariant that it advances exactly once per transaction.
+        self.bumpEpoch();
+
+        for (self.list[0..self.len], 0..) |e, i| {
+            var h = self.hash(@intFromPtr(e.addr));
+            while (self.index[h].version == self.version) h = (h + 1) & self.mask();
+            self.index[h] = .{
+                .version = self.version,
+                .addr = @intFromPtr(e.addr),
+                .idx = @intCast(i),
+            };
+        }
+        self.indexed = true;
+    }
+
+    /// Pre-reserve so a timed path never allocates. Unlike a hash map there is
+    /// no penalty for reserving more than you use
+    pub fn ensureCapacity(self: *WriteSet, gpa: Allocator, n: usize) Allocator.Error!void {
+        if (self.list.len < n) try self.growList(gpa, n);
+        if (n >= linear_threshold) {
+            var bits: u6 = min_index_bits;
+            while ((@as(usize, 1) << bits) < n * 4) bits += 1;
+            const needed = @as(usize, 1) << bits;
+            if (self.index.len < needed) {
+                if (self.index.len != 0) gpa.free(self.index);
+                self.index = try gpa.alloc(Slot, needed);
+                @memset(self.index, Slot{});
+                self.index_bits = bits;
+            }
+        }
+    }
+};
+
 /// A transaction context. One per thread.
 ///
 /// `Tx` carries the thread-local state of an in-flight (or about-to-start)
@@ -194,7 +420,7 @@ pub const Tx = struct {
 
     /// Indexed write set: maps `@intFromPtr(addr)` to the most recent value
     /// the transaction has decided to write. 
-    writes: std.AutoHashMapUnmanaged(usize, Word) = .empty,
+    writes: WriteSet = .empty,
 
     /// SLA mode adds an unconditional validation at commit time so that
     /// publication via an empty (or read-only) transaction is detected. 
@@ -274,16 +500,8 @@ pub const Tx = struct {
     /// After `txBegin`, call `read`/`write` and finally either `txCommit` or
     /// (on a `TxRetry` error) `reset`.
     pub fn txBegin(self: *Tx) void {
-        // Spin until the global lock is unheld, then take its value as our
-        // consistency snapshot.
-        while (true) {
-            const v = self.stm.seq_lock.load(.acquire);
-            if (v & 1 == 0) {
-                self.snapshot = v;
-                return;
-            }
-            std.atomic.spinLoopHint();
-        }
+        // start our snapshot at the last valid timestamp, we'll fail when we try and validate
+        self.snapshot  = self.stm.seq_lock.load(.acquire) & ~@as(u64, 1);
     }
 
     /// Attempt to commit the transaction. Returns `error.TxRetry` if the
@@ -316,10 +534,8 @@ pub const Tx = struct {
         // We hold the lock (it now reads `snapshot + 1`, an odd value). Any
         // concurrent transaction will spin in `txBegin` or in `validate`'s
         // odd-value check.
-        var it = self.writes.iterator();
-        while (it.next()) |entry| {
-            const target: *TxWord = @ptrFromInt(entry.key_ptr.*);
-            @atomicStore(Word, &target.raw, entry.value_ptr.*, .monotonic);
+        for (self.writes.items()) |entry| {
+                @atomicStore(Word, &entry.addr.raw, entry.val, .monotonic);
         }
 
         // Release the lock with a fresh even value, one greater than what we
@@ -335,7 +551,7 @@ pub const Tx = struct {
     /// loop do not re-allocate.
     pub fn reset(self: *Tx) void {
         self.reads.clearRetainingCapacity();
-        self.writes.clearRetainingCapacity();
+        self.writes.reset();
     }
 
     /// Transactional read. Returns `error.TxRetry` if validation fails.
@@ -349,8 +565,7 @@ pub const Tx = struct {
 
         // preserve the illusion that the transaction's writes have already 
         // happened.
-        const key: usize = @intFromPtr(addr);
-        if (self.writes.get(key)) |buffered| return buffered;
+        if (self.writes.find(addr)) |buffered| return buffered;
 
         var val = @atomicLoad(Word, &addr.raw, .monotonic);
 
@@ -368,7 +583,7 @@ pub const Tx = struct {
 
     /// Transactional write. the underlying memory is not touched until commit.
     pub fn write(self: *Tx, addr: *TxWord, val: Word) Error!void {
-        try self.writes.put(self.allocator, @intFromPtr(addr), val);
+        try self.writes.insert(self.allocator, addr, val);
     }
 
     /// Type-safe read of a multi-word `TxCell`. 
