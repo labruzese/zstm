@@ -335,7 +335,7 @@ pub const WriteSet = struct {
         self.len += 1;
     }
 
-    fn growList(self: *WriteSet, gpa: Allocator, new_cap: usize) Allocator.Error!void {
+    pub fn growList(self: *WriteSet, gpa: Allocator, new_cap: usize) Allocator.Error!void {
         const new = try gpa.alloc(Entry, new_cap);
         @memcpy(new[0..self.len], self.list[0..self.len]);
         if (self.list.len != 0) gpa.free(self.list);
