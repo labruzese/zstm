@@ -649,14 +649,32 @@ pub const Tx = struct {
 
             // Walk the read log, checking each location still holds the value
             // we originally saw. Any mismatch means the transaction is doomed.
-            for (self.reads.items) |entry| {
-                if (@atomicLoad(Word, &entry.addr.raw, .monotonic) != entry.val)
+            const reads = self.reads.items;
+            const prefetch_dist = @min(8, reads.len);
+            const n_prefetching = reads.len - prefetch_dist;
+            for (reads[0..n_prefetching], 0..) |entry, i| {
+                @prefetch(reads[i + prefetch_dist].addr, .{
+                    .rw = .read,
+                    .locality = 3,
+                    .cache = .data,
+                });
+                if (@atomicLoad(Word, &entry.addr.raw, .monotonic) != entry.val) {
+                    @branchHint(.unlikely);
                     return error.TxRetry;
+                }
+            }
+            for (reads[n_prefetching..]) |entry| {
+                if (@atomicLoad(Word, &entry.addr.raw, .monotonic) != entry.val) {
+                    @branchHint(.unlikely);
+                    return error.TxRetry;
+                }
             }
 
             // If the lock did not advance during our scan, the snapshot we
             // started with is a valid consistent snapshot.
-            if (self.stm.seq_lock.load(.acquire) == time) return time;
+            if (self.stm.seq_lock.load(.acquire) == time) {
+                return time;
+            }   
 
             // Otherwise a writer slipped in; restart the scan with the newer
             // snapshot. 
