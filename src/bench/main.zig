@@ -1,5 +1,6 @@
-const std = @import("std");
-const zbench = @import("zbench");
+//! zbench driver for the zstm microbenchmarks.
 
-test "counter p=1" {
-}
+const std = @import("std");
+const zstm = @import("zstm");
+const harness = @import("harness.zig");
+const workloads = @import("workloads.zig");

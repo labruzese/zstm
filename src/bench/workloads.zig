@@ -9,7 +9,6 @@ const std = @import("std");
 const zstm = @import("zstm");
 const harness = @import("harness.zig");
 
-const cfg = &harness.cfg;
 const TxWord = zstm.TxWord;
 const Word = zstm.Word;
 
@@ -21,6 +20,8 @@ const Word = zstm.Word;
 // and abort behavior rather than throughput of useful work.
 // ---------------------------------------------------------------------------
 pub const Counter = struct {
+    harness: *harness.Harness,
+
     pub fn maxReads() usize {
         return 1;
     }
@@ -31,7 +32,7 @@ pub const Counter = struct {
     var counter: TxWord = .init(0);
 
     pub fn reparse() void {
-        cfg.bmname = "Counter";
+        harness.cfg.bmname = "Counter";
     }
 
     pub fn init(gpa: std.mem.Allocator) !void {
@@ -54,7 +55,7 @@ pub const Counter = struct {
         // must equal the total number of committed transactions, and each
         // writer commit advances the sequence lock by exactly 2.
         const final = counter.unsafeLoad();
-        const txns = cfg.txcount.load(.acquire);
+        const txns = harness.cfg.txcount.load(.acquire);
         const seq = harness.stm.seq_lock.load(.acquire);
         if (final != txns) {
             std.debug.print("(final value = {d}, expected {d}) ", .{ final, txns });
@@ -77,8 +78,10 @@ pub const Counter = struct {
 // set holds exactly one.
 // ---------------------------------------------------------------------------
 pub const ReadNWrite1 = struct {
+    harness: *harness.Harness,
+
     pub fn maxReads() usize {
-        return cfg.ops;
+        return harness.cfg.ops;
     }
     pub fn maxWrites() usize {
         return 1;
@@ -87,11 +90,11 @@ pub const ReadNWrite1 = struct {
     var matrix: []TxWord = &.{};
 
     pub fn reparse() void {
-        if (cfg.bmname.len == 0) cfg.bmname = "ReadNWrite1";
+        if (harness.cfg.bmname.len == 0) harness.cfg.bmname = "ReadNWrite1";
     }
 
     pub fn init(gpa: std.mem.Allocator) !void {
-        matrix = try gpa.alloc(TxWord, cfg.elements);
+        matrix = try gpa.alloc(TxWord, harness.cfg.elements);
         // match ReadNWrite1Bench.cpp's bench_init exactly
         var s: u32 = 1;
         for (matrix) |*w| w.* = .init(harness.randR32(&s));
@@ -101,8 +104,8 @@ pub const ReadNWrite1 = struct {
         var sum: Word = 0;
         var loc: usize = 0;
         var i: u32 = 0;
-        while (i < cfg.ops) : (i += 1) {
-            loc = harness.randR32(seed) % cfg.elements;
+        while (i < harness.cfg.ops) : (i += 1) {
+            loc = harness.randR32(seed) % harness.cfg.elements;
             sum +%= try t.read(&matrix[loc]);
         }
         try t.write(&matrix[loc], sum);
@@ -133,21 +136,23 @@ pub const ReadNWrite1 = struct {
 // exercises the write-set insert path and the commit-time writeback loop.
 // ---------------------------------------------------------------------------
 pub const ReadWriteN = struct {
+    harness: *harness.Harness,
+
     pub fn maxReads() usize {
-        return cfg.ops;
+        return harness.cfg.ops;
     }
     pub fn maxWrites() usize {
-        return cfg.ops;
+        return harness.cfg.ops;
     }
 
     var matrix: []TxWord = &.{};
 
     pub fn reparse() void {
-        if (cfg.bmname.len == 0) cfg.bmname = "ReadWriteN";
+        if (harness.cfg.bmname.len == 0) harness.cfg.bmname = "ReadWriteN";
     }
 
     pub fn init(gpa: std.mem.Allocator) !void {
-        matrix = try gpa.alloc(TxWord, cfg.elements);
+        matrix = try gpa.alloc(TxWord, harness.cfg.elements);
         // match ReadWriteNBench.cpp's bench_init
         var s: u32 = 1;
         for (matrix) |*w| w.* = .init(harness.randR32(&s));
@@ -160,12 +165,12 @@ pub const ReadWriteN = struct {
         var loc: [1024]usize = undefined;
 
         var i: u32 = 0;
-        while (i < cfg.ops) : (i += 1) {
-            loc[i] = harness.randR32(seed) % cfg.elements;
+        while (i < harness.cfg.ops) : (i += 1) {
+            loc[i] = harness.randR32(seed) % harness.cfg.elements;
             snapshot[i] = try t.read(&matrix[loc[i]]);
         }
         i = 0;
-        while (i < cfg.ops) : (i += 1) {
+        while (i < harness.cfg.ops) : (i += 1) {
             try t.write(&matrix[loc[i]], 1 +% snapshot[i]);
         }
     }
@@ -197,6 +202,8 @@ pub const ReadWriteN = struct {
 //   R, W    reads and writes per ten operations
 // ---------------------------------------------------------------------------
 pub const Disjoint = struct {
+    harness: *harness.Harness,
+
     pub fn maxReads() usize {
         return locations_per_transaction;
     }
@@ -225,12 +232,12 @@ pub const Disjoint = struct {
     var use_shared_read_buffer: bool = false;
 
     pub fn reparse() void {
-        if (cfg.bmname.len == 0) cfg.bmname = "DrDw";
+        if (harness.cfg.bmname.len == 0) harness.cfg.bmname = "DrDw";
     }
 
     pub fn init(gpa: std.mem.Allocator) !void {
         // Same field order as the C++ `bench_init`: size, read, write.
-        var it = std.mem.splitScalar(u8, cfg.bmname, '-');
+        var it = std.mem.splitScalar(u8, harness.cfg.bmname, '-');
         _ = it.next(); // prefix
         const size_s = it.next() orelse return error.BadBenchName;
         const read_s = it.next() orelse return error.BadBenchName;
@@ -239,7 +246,7 @@ pub const Disjoint = struct {
         locations_per_transaction = try std.fmt.parseInt(u32, size_s, 10);
         reads_per_ten = try std.fmt.parseInt(u32, read_s, 10);
         writes_per_ten = try std.fmt.parseInt(u32, write_s, 10);
-        use_shared_read_buffer = std.mem.startsWith(u8, cfg.bmname, "SrDw");
+        use_shared_read_buffer = std.mem.startsWith(u8, harness.cfg.bmname, "SrDw");
 
         private_buffers = try gpa.alloc(PaddedBuffer, BUFFER_COUNT);
         public_buffer = try gpa.create(PaddedBuffer);
@@ -299,7 +306,7 @@ pub const Disjoint = struct {
     }
 
     fn body(t: *zstm.Tx, id: usize, act: u32, start: usize) zstm.Error!void {
-        if (act < cfg.lookpct) {
+        if (act < harness.cfg.lookpct) {
             try roTransaction(t, id, start);
         } else {
             try rRwTransaction(t, id, start);

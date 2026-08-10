@@ -4,22 +4,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const opts = .{ .target = target, .optimize = optimize };
-
     const zstm = b.addModule("zstm", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const zbench = b.dependency("zbench", opts).module("zbench");
     const bench = b.createModule(.{
-        .root_source_file = b.path("bench/main.zig"),
+        .root_source_file = b.path("src/bench/main.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
     bench.addImport("zstm", zstm);
-    bench.addImport("zbench", zbench);
 
     const bench_exe = b.addExecutable(.{
         .name = "bench",
