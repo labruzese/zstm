@@ -191,17 +191,17 @@ pub const WriteSet = struct {
     };
 
     const Slot = struct {
+        addr: usize, 
         /// Occupied iff equal to the owning WriteSet's `version`.
-        version: u64 = 0,
-        addr: usize = 0,
-        idx: u32 = 0,
+        version: u32,
+        idx: u32 
     };
 
     /// At or below this many entries we linear-scan and never touch the index.
-    const linear_max = 8;
+    const linear_max = std.atomic.cache_line / @sizeOf(Entry);
     const min_index_bits: u6 = 5;
 
-    list: []Entry = &.{},
+    list: []align(std.atomic.cache_line) Entry = &.{},
     len: usize = 0,
 
     index: []Slot = &.{},
@@ -210,7 +210,7 @@ pub const WriteSet = struct {
     indexed: bool = false,
 
     /// Bumped by `reset` and by `reindex`; never 0 while in use.
-    version: u64 = 1,
+    version: u32 = 1,
 
     pub const empty: WriteSet = .{};
 
@@ -313,8 +313,8 @@ pub const WriteSet = struct {
         // `append` may have reallocated `list`; the index holds indices, not
         // pointers, so existing stamps remain valid.
         self.index[h] = .{
-            .version = self.version,
             .addr = key,
+            .version = self.version,
             .idx = @intCast(self.len - 1),
         };
 
@@ -336,7 +336,7 @@ pub const WriteSet = struct {
     }
 
     fn growList(self: *WriteSet, gpa: Allocator, new_cap: usize) Allocator.Error!void {
-        const new = try gpa.alloc(Entry, new_cap);
+        const new = try gpa.alignedAlloc(Entry, @enumFromInt(@alignOf(@TypeOf(self.list))), new_cap);
         @memcpy(new[0..self.len], self.list[0..self.len]);
         if (self.list.len != 0) gpa.free(self.list);
         self.list = new;
@@ -352,7 +352,11 @@ pub const WriteSet = struct {
         if (self.index.len < needed) {
             if (self.index.len != 0) gpa.free(self.index);
             self.index = try gpa.alloc(Slot, needed);
-            @memset(self.index, Slot{}); // fresh memory is garbage; stamp stale once
+            @memset(self.index, .{
+                .addr = undefined, 
+                .version = 0, // make sure stamp is stale
+                .idx = undefined,
+            });
             self.index_bits = bits;
         } else {
             // Reuse the existing (possibly larger) table at its full size.
