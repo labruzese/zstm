@@ -201,7 +201,8 @@ pub const WriteSet = struct {
     const linear_max = std.atomic.cache_line / @sizeOf(Entry);
     const min_index_bits: u6 = 5;
 
-    list: []align(std.atomic.cache_line) Entry = &.{},
+    const list_alignment = std.atomic.cache_line;
+    list: []align(list_alignment) Entry = &.{},
     len: usize = 0,
 
     index: []Slot = &.{},
@@ -336,7 +337,7 @@ pub const WriteSet = struct {
     }
 
     fn growList(self: *WriteSet, gpa: Allocator, new_cap: usize) Allocator.Error!void {
-        const new = try gpa.alignedAlloc(Entry, @enumFromInt(@alignOf(@TypeOf(self.list))), new_cap);
+        const new = try gpa.alignedAlloc(Entry, .fromByteUnits(list_alignment), new_cap);
         @memcpy(new[0..self.len], self.list[0..self.len]);
         if (self.list.len != 0) gpa.free(self.list);
         self.list = new;
@@ -354,7 +355,7 @@ pub const WriteSet = struct {
             self.index = try gpa.alloc(Slot, needed);
             @memset(self.index, .{
                 .addr = undefined, 
-                .version = 0, // make sure stamp is stale
+                .version = 0, // make sure stamp stale
                 .idx = undefined,
             });
             self.index_bits = bits;
@@ -391,7 +392,11 @@ pub const WriteSet = struct {
             if (self.index.len < needed) {
                 if (self.index.len != 0) gpa.free(self.index);
                 self.index = try gpa.alloc(Slot, needed);
-                @memset(self.index, Slot{});
+                @memset(self.index, Slot{
+                    .addr = undefined,
+                    .version = 0, // make sure this is a stale version
+                    .idx = undefined,
+                });
                 self.index_bits = bits;
             }
         }
