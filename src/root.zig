@@ -180,7 +180,7 @@ const ReadLogEntry = struct {
 /// writeback is a linear scan over exactly the live entries. The index stores
 /// *indices* into `list`, never pointers, so growing `list` cannot invalidate it.
 ///
-/// Small write sets skip the index entirely (`linear_threshold`): probing a
+/// Small write sets skip the index entirely (`linear_max`): probing a
 /// handful of entries linearly beats hashing.
 ///
 /// Private to one `Tx`, so nothing here needs atomics.
@@ -197,8 +197,8 @@ pub const WriteSet = struct {
         idx: u32 = 0,
     };
 
-    /// Below this many entries we linear-scan and never touch the index.
-    const linear_threshold = 8;
+    /// At or below this many entries we linear-scan and never touch the index.
+    const linear_max = 8;
     const min_index_bits: u6 = 5;
 
     list: []Entry = &.{},
@@ -252,9 +252,9 @@ pub const WriteSet = struct {
 
     /// Fibonacci hashing over the significant address bits.
     ///
-    /// TxWord is word-aligned, so the low 3 bits are always zero -- keeping them
-    /// would leave 7/8 of the table unreachable. We take the *high* bits of the
-    /// product, where multiplicative hashing concentrates entropy.
+    /// TxWord is word-aligned, so the low 3 bits are always zero. 
+    /// We take the *high* bits of the product, where multiplicative
+    /// hashing concentrates entropy.
     fn hash(self: *const WriteSet, key: usize) usize {
         const mixed: u64 = @as(u64, key >> 3) *% 0x9E3779B97F4A7C15;
         const shift: u6 = @intCast(64 - @as(u7, self.index_bits));
@@ -296,7 +296,7 @@ pub const WriteSet = struct {
                 }
             }
             try self.append(gpa, addr, val);
-            if (self.len >= linear_threshold) try self.reindex(gpa);
+            if (self.len > linear_max) try self.reindex(gpa);
             return;
         }
 
@@ -335,7 +335,7 @@ pub const WriteSet = struct {
         self.len += 1;
     }
 
-    pub fn growList(self: *WriteSet, gpa: Allocator, new_cap: usize) Allocator.Error!void {
+    fn growList(self: *WriteSet, gpa: Allocator, new_cap: usize) Allocator.Error!void {
         const new = try gpa.alloc(Entry, new_cap);
         @memcpy(new[0..self.len], self.list[0..self.len]);
         if (self.list.len != 0) gpa.free(self.list);
@@ -380,7 +380,7 @@ pub const WriteSet = struct {
     /// no penalty for reserving more than you use
     pub fn ensureCapacity(self: *WriteSet, gpa: Allocator, n: usize) Allocator.Error!void {
         if (self.list.len < n) try self.growList(gpa, n);
-        if (n >= linear_threshold) {
+        if (n > linear_max) {
             var bits: u6 = min_index_bits;
             while ((@as(usize, 1) << bits) < n * 4) bits += 1;
             const needed = @as(usize, 1) << bits;
