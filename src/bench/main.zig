@@ -113,21 +113,27 @@ const suite = [_]Bench{
         .params = .{ .elements = 1 << 16, .ops = 16 },
     },
     .{
-        // WriteSet.linear_max == cache_line/@sizeOf(Entry) == 4 entries, so a
-        // 4-write transaction never builds the hash index...
+        // `WriteSet.insert` reindexes once `len > linear_max`, and
+        // linear_max == cache_line/@sizeOf(Entry). on x86_64 and aarch64 zig
+        // reports a 128-byte cache line, so that is 8 entries: a transaction
+        // with 8 writes is the largest one that never builds the hash index...
         .name = "rw-n-linear",
         .workload = workloads.ReadWriteN,
-        .desc = "4 reads + 4 writes; write set stays on the linear scan path",
-        .params = .{ .elements = 1 << 16, .ops = 4 },
+        .desc = "8 reads + 8 writes; largest write set that stays linear",
+        .params = .{ .elements = 1 << 16, .ops = 8 },
         .limits = .{ .max_ops = 1024 },
     },
     .{
-        // ...and an 8-write transaction does, on every single transaction.
-        // The pair isolates the cost of the index build.
+        // ...and 9 writes is the smallest one that does, on every single
+        // transaction. one extra write is the whole difference between the
+        // pair, so what is left is the cost of the index build.
+        //
+        // both of these are wrong by one on a target whose cache line is 64
+        // bytes: check `linear_max` before trusting the pair elsewhere.
         .name = "rw-n-indexed",
         .workload = workloads.ReadWriteN,
-        .desc = "8 reads + 8 writes; write set crosses into the hashed path",
-        .params = .{ .elements = 1 << 16, .ops = 8 },
+        .desc = "9 reads + 9 writes; smallest write set that builds the index",
+        .params = .{ .elements = 1 << 16, .ops = 9 },
         .limits = .{ .max_ops = 1024 },
     },
     .{
@@ -194,7 +200,7 @@ const Options = struct {
     verify: bool = true,
     pin: bool = false,
     quiet: bool = false,
-    /// Global overrides for the per-benchmark params; null means "leave alone".
+    /// global overrides for the per-benchmark params; null means "leave alone".
     elements: ?u32 = null,
     ops: ?u32 = null,
     nops_after_tx: ?u32 = null,
@@ -217,7 +223,7 @@ const usage =
     \\  --duration <ms>        length of one timed trial (default: 1000)
     \\  --warmup <ms>          discarded warm-up before each trial (default: 200)
     \\  --execute <n>          fixed transactions per thread instead of a timed run
-    \\  --no-latency           skip latency sampling (removes its ~0.5% overhead)
+    \\  --no-latency           skip latency sampling (its measured cost is reported)
     \\  --latency-stride <n>   sample one transaction in n (default: 64)
     \\  --pin                  pin worker i to CPU i
     \\  --no-verify            skip the workload's post-run invariant check
@@ -364,9 +370,7 @@ fn splitUints(arena: Allocator, s: []const u8) ![]const u32 {
     return out.items;
 }
 
-// =============================================================================
-// 3. One measurement
-// =============================================================================
+// one measurement
 
 /// Log-scale latency histogram: 8 sub-buckets per octave, so bucket width is
 /// under 13% of the value it holds. 4 KiB per thread, and the worker only ever
@@ -474,8 +478,6 @@ const RunCtx = struct {
     warmup_execute: u32,
     /// 0 = latency sampling off.
     sample_stride: u32,
-    /// Cost of reading the clock, subtracted from every sample.
-    sample_overhead_ns: u64,
     pin: bool,
     ncpu: u32,
     stats: []ThreadStats,
@@ -533,15 +535,14 @@ fn Worker(comptime W: type) type {
 
             // ---- measured phase
             const stride = ctx.sample_stride;
-            const overhead = ctx.sample_overhead_ns;
             var countdown: u32 = stride;
             if (ctx.execute == 0) {
                 while (ctx.running.load(.acquire))
-                    step(&tx, id, &seed, &aborts, &st, stride, overhead, &countdown);
+                    step(&tx, id, &seed, &aborts, &st, stride, &countdown);
             } else {
                 var i: u32 = 0;
                 while (i < ctx.execute) : (i += 1)
-                    step(&tx, id, &seed, &aborts, &st, stride, overhead, &countdown);
+                    step(&tx, id, &seed, &aborts, &st, stride, &countdown);
             }
 
             ctx.barrier.wait(); // (4) the clock has stopped
@@ -553,8 +554,13 @@ fn Worker(comptime W: type) type {
         /// One transaction, plus the non-transactional filler that follows it.
         /// Every `stride`-th call is timed; the sample spans the whole retry
         /// loop, so it is the latency of a *completed* transaction including
-        /// everything it had to redo. `overhead` takes the clock read itself
-        /// back out, which matters when a transaction costs tens of ns.
+        /// everything it had to redo.
+        ///
+        /// Samples go in raw, clock read and all. Subtracting a constant from
+        /// every sample shifts every quantile by that same constant, so the
+        /// correction is exact whether it happens here or at report time --
+        /// and at report time it can use a clock cost measured under this
+        /// run's load rather than one guessed before the run started.
         inline fn step(
             tx: *zstm.Tx,
             id: u32,
@@ -562,7 +568,6 @@ fn Worker(comptime W: type) type {
             aborts: *u64,
             st: *ThreadStats,
             stride: u32,
-            overhead: u64,
             countdown: *u32,
         ) void {
             if (stride != 0) {
@@ -571,7 +576,7 @@ fn Worker(comptime W: type) type {
                     countdown.* = stride;
                     const t0 = nowNs();
                     W.test_(tx, id, seed, aborts);
-                    st.hist.add((nowNs() -| t0) -| overhead);
+                    st.hist.add(nowNs() -| t0);
                     st.commits += 1;
                     harness.nontxnwork();
                     return;
@@ -596,7 +601,11 @@ const Trial = struct {
     total_aborts: u64,
     min_thread_commits: u64,
     max_thread_commits: u64,
+    /// raw samples: each one still contains one clock read. `timer_ns` is what
+    /// comes back out of them.
     hist: Histogram,
+    /// cost of a single clock read, measured for this trial specifically.
+    timer_ns: u64,
     ru: RuDelta,
 
     fn tps(self: Trial) f64 {
@@ -660,8 +669,7 @@ fn nowNs() u64 {
 }
 
 /// Median cost of one `nowNs`, so latency samples can be corrected for the
-/// instrument. On a vDSO clock this lands around 20ns -- the same order as a
-/// whole uncontended transaction, which is why it is worth subtracting.
+/// instrument. 
 fn calibrateTimer() u64 {
     var samples: [129]u64 = undefined;
     for (&samples) |*s| {
@@ -737,7 +745,6 @@ fn runTrial(
         .execute = o.execute,
         .warmup_execute = if (o.warmup_ms == 0) 0 else @max(1, o.execute / 8),
         .sample_stride = if (o.latency) o.latency_stride else 0,
-        .sample_overhead_ns = timer_overhead_ns,
         .pin = o.pin,
         .ncpu = @max(1, cpuCount()),
         .stats = stats,
@@ -780,6 +787,15 @@ fn runTrial(
     const ru1 = RuDelta.sample();
     const seq1 = harness.stm.seq_lock.load(.acquire);
 
+    // time the clock now, before the workers are joined: they are still on
+    // their cores spinning out the last barrier, so the frequency and the
+    // memory traffic are the ones the samples were taken under. a clock read
+    // costs whatever the core's current frequency says it costs, and a core
+    // running alone on an idle machine is not the core that ran the benchmark.
+    // it costs a few microseconds and lands after `t1`, so it cannot touch
+    // the throughput number.
+    const timer_ns = calibrateTimer();
+
     for (workers) |t| t.join();
 
     var trial: Trial = .{
@@ -792,6 +808,7 @@ fn runTrial(
         .min_thread_commits = std.math.maxInt(u64),
         .max_thread_commits = 0,
         .hist = .{},
+        .timer_ns = timer_ns,
         .ru = RuDelta.since(ru1, ru0),
     };
     for (stats) |*s| {
@@ -822,9 +839,7 @@ fn cpuCount() u32 {
     return @intCast(std.Thread.getCpuCount() catch 1);
 }
 
-// =============================================================================
-// 4. Aggregation
-// =============================================================================
+// aggregation
 
 /// One row of output. Field names are the CSV header *and* the JSON keys *and*
 /// what `--baseline` looks for, so adding a metric here plumbs it everywhere.
@@ -856,10 +871,22 @@ const Record = struct {
     aborts_per_commit: f64,
     writer_pct: f64,
 
+    /// Latency quantiles with the clock read already taken out. A zero here
+    /// means the raw sample did not clear `timer_ns`, i.e. the transaction is
+    /// faster than this machine can measure one of -- not that it took no time.
     p50_ns: u64,
     p99_ns: u64,
     p999_ns: u64,
     max_ns: u64,
+
+    /// What latency sampling cost, measured rather than assumed.
+    sample_stride: u32,
+    /// One clock read, timed right after this point's run, under its load.
+    timer_ns: u64,
+    /// Two clock reads every `sample_stride` transactions, amortized.
+    sampling_ns_per_tx: f64,
+    /// `sampling_ns_per_tx` as a share of this row's `ns_per_tx`.
+    sampling_pct: f64,
 
     imbalance_pct: f64,
     user_ns: u64,
@@ -873,7 +900,7 @@ const Record = struct {
     maxrss_kb: u64,
     verified: []const u8,
 
-    /// Filled in only for the on-screen table; not part of the saved schema.
+    /// filled in only for the on-screen table; not part of the saved schema.
     const Extra = struct {
         desc: []const u8 = "",
         speedup: f64 = 0,
@@ -929,6 +956,16 @@ fn summarize(
     const commits_f = @as(f64, @floatFromInt(@max(1, rep.commits)));
     const cpu_ns = rep.ru.user_ns + rep.ru.sys_ns;
 
+    const ns_per_tx = @as(f64, @floatFromInt(rep.wall_ns)) *
+        @as(f64, @floatFromInt(threads)) / commits_f;
+
+    // two clock reads per sampled transaction, spread over `stride` of them.
+    const stride = if (o.latency) o.latency_stride else 0;
+    const sampling_ns_per_tx: f64 = if (stride == 0)
+        0
+    else
+        2 * @as(f64, @floatFromInt(rep.timer_ns)) / @as(f64, @floatFromInt(stride));
+
     return .{
         .bench = name,
         .mode = @tagName(mode),
@@ -947,8 +984,7 @@ fn summarize(
         .tx_per_s_max = rates[order[n - 1]],
         .cv_pct = if (m > 0) sd / m * 100 else 0,
 
-        .ns_per_tx = @as(f64, @floatFromInt(rep.wall_ns)) *
-            @as(f64, @floatFromInt(threads)) / commits_f,
+        .ns_per_tx = ns_per_tx,
         .commits = rep.commits,
         .aborts = rep.aborts,
         .writer_commits = rep.writer_commits,
@@ -959,10 +995,17 @@ fn summarize(
         .aborts_per_commit = @as(f64, @floatFromInt(rep.aborts)) / commits_f,
         .writer_pct = @as(f64, @floatFromInt(rep.writer_commits)) * 100 / commits_f,
 
-        .p50_ns = rep.hist.quantile(0.50),
-        .p99_ns = rep.hist.quantile(0.99),
-        .p999_ns = rep.hist.quantile(0.999),
-        .max_ns = rep.hist.max,
+        // saturating: a quantile under the clock's own cost tells you the
+        // transaction is below the noise floor, and nothing more than that.
+        .p50_ns = rep.hist.quantile(0.50) -| rep.timer_ns,
+        .p99_ns = rep.hist.quantile(0.99) -| rep.timer_ns,
+        .p999_ns = rep.hist.quantile(0.999) -| rep.timer_ns,
+        .max_ns = rep.hist.max -| rep.timer_ns,
+
+        .sample_stride = stride,
+        .timer_ns = rep.timer_ns,
+        .sampling_ns_per_tx = sampling_ns_per_tx,
+        .sampling_pct = if (ns_per_tx > 0) sampling_ns_per_tx / ns_per_tx * 100 else 0,
 
         .imbalance_pct = if (rep.max_thread_commits > 0)
             @as(f64, @floatFromInt(rep.max_thread_commits - rep.min_thread_commits)) *
@@ -985,9 +1028,7 @@ fn summarize(
     };
 }
 
-// =============================================================================
-// 5. Reporting
-// =============================================================================
+// reporting
 
 fn cell(w: *Writer, width: usize, comptime fmt: []const u8, args: anytype) !void {
     var buf: [64]u8 = undefined;
@@ -1010,6 +1051,14 @@ fn groupDigits(out: []u8, v: u64) []const u8 {
         n += 1;
     }
     return out[0..n];
+}
+
+/// a corrected quantile of zero means the raw sample never cleared the clock
+/// read. say so instead of printing a number that is entirely instrument.
+fn fmtLatency(out: []u8, ns: u64, timer_ns: u64) []const u8 {
+    if (ns != 0) return fmtDur(out, ns);
+    var tmp: [24]u8 = undefined;
+    return std.fmt.bufPrint(out, "<{s}", .{fmtDur(&tmp, timer_ns)}) catch "?";
 }
 
 fn fmtDur(out: []u8, ns: u64) []const u8 {
@@ -1086,14 +1135,14 @@ fn printTable(w: *Writer, records: []const Record, extras: []const Record.Extra)
             try cell(w, table_header[6].w, "{d:.3}", .{r.aborts_per_commit});
             try cell(w, table_header[7].w, "{d:.2}", .{r.abort_pct});
             try cell(w, table_header[8].w, "{d:.1}", .{r.writer_pct});
-            if (r.p50_ns != 0 or r.p99_ns != 0) {
-                try cell(w, table_header[9].w, "{s}", .{fmtDur(&b2, r.p50_ns)});
-                try cell(w, table_header[10].w, "{s}", .{fmtDur(&b3, r.p99_ns)});
-                try cell(w, table_header[11].w, "{s}", .{fmtDur(&b4, r.p999_ns)});
+            if (r.sample_stride == 0) {
+                try cell(w, table_header[9].w, "{s}", .{"off"});
+                try cell(w, table_header[10].w, "{s}", .{"off"});
+                try cell(w, table_header[11].w, "{s}", .{"off"});
             } else {
-                try cell(w, table_header[9].w, "{s}", .{"-"});
-                try cell(w, table_header[10].w, "{s}", .{"-"});
-                try cell(w, table_header[11].w, "{s}", .{"-"});
+                try cell(w, table_header[9].w, "{s}", .{fmtLatency(&b2, r.p50_ns, r.timer_ns)});
+                try cell(w, table_header[10].w, "{s}", .{fmtLatency(&b3, r.p99_ns, r.timer_ns)});
+                try cell(w, table_header[11].w, "{s}", .{fmtLatency(&b4, r.p999_ns, r.timer_ns)});
             }
             try cell(w, table_header[12].w, "{d:.1}", .{r.imbalance_pct});
             try cell(w, table_header[13].w, "{d:.1}", .{r.sys_pct});
@@ -1157,7 +1206,7 @@ fn printHints(w: *Writer, block: []const Record) !void {
     );
 }
 
-const legend =
+const column_legend =
     \\
     \\Columns
     \\  tx/s     committed transactions per second, median of all trials
@@ -1172,9 +1221,81 @@ const legend =
     \\  sys%     kernel share of CPU time; ics/ktx = involuntary context switches per 1k tx
     \\
     \\All rows but tx/s come from the median-throughput trial, so a row describes
-    \\one real run. Latency sampling costs ~0.5% throughput; --no-latency removes it.
+    \\one real run.
     \\
 ;
+
+/// what the latency columns actually cost, from this run's own measurements.
+/// the clock is timed once per point, right after that point finishes and
+/// while its threads are still on their cores, so the number below is the cost
+/// of a clock read under load rather than one guessed on an idle machine.
+fn printSamplingNote(w: *Writer, records: []const Record) !void {
+    if (records.len == 0) return;
+
+    if (records[0].sample_stride == 0) {
+        try w.writeAll(
+            \\
+            \\Latency sampling
+            \\  off (--no-latency): the p50/p99/p99.9 columns read "off" and nothing
+            \\  but the workload itself is on the clock.
+            \\
+        );
+        return;
+    }
+
+    var timer_sum: u64 = 0;
+    var timer_min: u64 = std.math.maxInt(u64);
+    var timer_max: u64 = 0;
+    var worst = records[0];
+    var floored: usize = 0;
+    for (records) |r| {
+        timer_sum += r.timer_ns;
+        timer_min = @min(timer_min, r.timer_ns);
+        timer_max = @max(timer_max, r.timer_ns);
+        if (r.sampling_pct > worst.sampling_pct) worst = r;
+        if (r.p50_ns == 0) floored += 1;
+    }
+    const timer_mean = @as(f64, @floatFromInt(timer_sum)) /
+        @as(f64, @floatFromInt(records.len));
+
+    try w.print(
+        \\
+        \\Latency sampling  (measured, not assumed)
+        \\  clock read        {d:.1} ns mean, {d}..{d} ns across {d} measurement {s}
+        \\  cost per tx       {d:.2} ns = 2 clock reads / {d} transactions
+        \\  worst distortion  {d:.2}% of ns/tx, at {s} mode={s} threads={d} ({d:.1} ns/tx)
+        \\
+    , .{
+        timer_mean,
+        timer_min,
+        timer_max,
+        records.len,
+        if (records.len == 1) "point" else "points",
+        2 * timer_mean / @as(f64, @floatFromInt(records[0].sample_stride)),
+        records[0].sample_stride,
+        worst.sampling_pct,
+        worst.bench,
+        worst.mode,
+        worst.threads,
+        worst.ns_per_tx,
+    });
+    try w.print(
+        \\  p50/p99/p99.9 already have one clock read subtracted. A quantile that
+        \\  did not clear it prints as "<{d}ns": the transaction is faster than this
+        \\  machine can time one, so no honest number exists for it.
+        \\
+    , .{timer_max});
+    if (floored != 0) try w.print(
+        "  {d} of {d} rows are below that floor. Raise --latency-stride to cut the\n" ++
+            "  cost per tx, or use --no-latency for untainted throughput.\n",
+        .{ floored, records.len },
+    );
+}
+
+fn printLegend(w: *Writer, records: []const Record) !void {
+    try w.writeAll(column_legend);
+    try printSamplingNote(w, records);
+}
 
 fn printCsv(w: *Writer, records: []const Record) !void {
     inline for (@typeInfo(Record).@"struct".fields, 0..) |f, i| {
@@ -1218,9 +1339,7 @@ fn finite(v: f64) f64 {
     return if (std.math.isFinite(v)) v else 0;
 }
 
-// =============================================================================
-// 6. Baseline comparison
-// =============================================================================
+// baseline comparison
 
 /// Parse a csv written by `--save`. Columns are matched by header name, so a
 /// baseline recorded before a new metric existed still loads.
@@ -1339,12 +1458,7 @@ fn printComparison(w: *Writer, records: []const Record, base: []const Record) !v
     }
 }
 
-// =============================================================================
-// 7. Driver
-// =============================================================================
-
-/// Cost of one clock read, measured once at startup.
-var timer_overhead_ns: u64 = 0;
+// driver
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -1352,7 +1466,6 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     const o = try parseArgs(arena, init.minimal.args);
-    timer_overhead_ns = calibrateTimer();
 
     var out_buf: [64 * 1024]u8 = undefined;
     var out_file = std.Io.File.stdout().writer(io, &out_buf);
@@ -1381,7 +1494,7 @@ pub fn main(init: std.process.Init) !void {
     var records: std.ArrayList(Record) = .empty;
     var extras: std.ArrayList(Record.Extra) = .empty;
 
-    // Total point count up front, so the progress line can say how far along we are.
+    // total point count up front, so the progress line can say how far along we are.
     var total_points: u32 = 0;
     inline for (suite) |b| {
         if (selected(b, o)) {
@@ -1495,7 +1608,7 @@ pub fn main(init: std.process.Init) !void {
     switch (o.format) {
         .table => {
             try printTable(out, records.items, extras.items);
-            if (o.baseline == null) try out.writeAll(legend);
+            if (o.baseline == null) try printLegend(out, records.items);
         },
         .csv => try printCsv(out, records.items),
         .json => try printJson(out, records.items),
@@ -1506,7 +1619,7 @@ pub fn main(init: std.process.Init) !void {
             fatal("cannot read baseline '{s}': {t}", .{ path, err });
         const base = try parseCsv(arena, text);
         try printComparison(out, records.items, base);
-        if (o.format == .table) try out.writeAll(legend);
+        if (o.format == .table) try printLegend(out, records.items);
     }
 
     if (o.save) |path| {
@@ -1574,9 +1687,7 @@ fn applyOverrides(p: Params, o: Options) Params {
     return out;
 }
 
-// =============================================================================
-// 8. Tests for the bits that are easy to get quietly wrong
-// =============================================================================
+// tests for the bits that are easy to get quietly wrong
 
 test "histogram buckets cover their values without gaps" {
     const H = Histogram;
@@ -1661,6 +1772,38 @@ test "a baseline missing a column still loads the rest" {
     try std.testing.expectEqual(@as(u32, 2), parsed[0].threads);
     try std.testing.expectEqual(@as(f64, 555.5), parsed[0].tx_per_s);
     try std.testing.expectEqual(@as(u64, 0), parsed[0].p99_ns); // absent -> zero
+}
+
+test "latency below the clock's own cost is reported as such" {
+    var buf: [32]u8 = undefined;
+    // corrected quantile survived the subtraction: print it.
+    try std.testing.expectEqualStrings("140ns", fmtLatency(&buf, 140, 22));
+    try std.testing.expectEqualStrings("1.40us", fmtLatency(&buf, 1400, 22));
+    // it did not: the transaction is faster than one clock read, so the only
+    // honest thing to say is which side of the instrument it fell on.
+    try std.testing.expectEqualStrings("<22ns", fmtLatency(&buf, 0, 22));
+}
+
+test "correcting at report time agrees with correcting each sample" {
+    // subtracting a constant shifts every quantile by that constant, so it
+    // does not matter whether the clock read comes off each sample or off the
+    // quantile -- except that the histogram quantizes, and the two orders
+    // quantize different numbers. the disagreement stays inside one bucket,
+    // which is the precision the histogram had to begin with.
+    var raw: Histogram = .{};
+    var pre_corrected: Histogram = .{};
+    const timer_ns: u64 = 20;
+    for ([_]u64{ 120, 140, 160, 180, 5000 }) |v| {
+        raw.add(v);
+        pre_corrected.add(v - timer_ns);
+    }
+    for ([_]f64{ 0.5, 0.99, 0.999 }) |q| {
+        const at_report = raw.quantile(q) -| timer_ns;
+        const at_sample = pre_corrected.quantile(q);
+        const bucket = Histogram.width(Histogram.index(raw.quantile(q)));
+        const diff = @max(at_report, at_sample) - @min(at_report, at_sample);
+        try std.testing.expect(diff <= bucket);
+    }
 }
 
 test "significance needs a delta bigger than the noise" {
