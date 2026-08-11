@@ -879,7 +879,7 @@ const Record = struct {
     p999_ns: u64,
     max_ns: u64,
 
-    /// What latency sampling cost, measured rather than assumed.
+    /// What latency sampling cost
     sample_stride: u32,
     /// One clock read, timed right after this point's run, under its load.
     timer_ns: u64,
@@ -1260,7 +1260,7 @@ fn printSamplingNote(w: *Writer, records: []const Record) !void {
 
     try w.print(
         \\
-        \\Latency sampling  (measured, not assumed)
+        \\Latency sampling  (measured)
         \\  clock read        {d:.1} ns mean, {d}..{d} ns across {d} measurement {s}
         \\  cost per tx       {d:.2} ns = 2 clock reads / {d} transactions
         \\  worst distortion  {d:.2}% of ns/tx, at {s} mode={s} threads={d} ({d:.1} ns/tx)
