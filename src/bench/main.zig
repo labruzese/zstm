@@ -1338,16 +1338,17 @@ fn printLegend(w: *Writer, records: []const Record) !void {
 }
 
 fn printCsv(w: *Writer, records: []const Record) !void {
-    inline for (@typeInfo(Record).@"struct".fields, 0..) |f, i| {
+    const info = @typeInfo(Record).@"struct";
+    inline for (info.field_names, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
-        try w.writeAll(f.name);
+        try w.writeAll(name);
     }
     try w.writeByte('\n');
     for (records) |r| {
-        inline for (@typeInfo(Record).@"struct".fields, 0..) |f, i| {
+        inline for (info.field_names, info.field_types, 0..) |name, ftype, i| {
             if (i != 0) try w.writeByte(',');
-            const v = @field(r, f.name);
-            switch (@typeInfo(f.type)) {
+            const v = @field(r, name);
+            switch (@typeInfo(ftype)) {
                 .pointer => try w.print("{s}", .{v}),
                 .float => try w.print("{d:.4}", .{finite(v)}),
                 else => try w.print("{d}", .{v}),
@@ -1358,16 +1359,17 @@ fn printCsv(w: *Writer, records: []const Record) !void {
 }
 
 fn printJson(w: *Writer, records: []const Record) !void {
+    const info = @typeInfo(Record).@"struct";
     try w.writeAll("[\n");
     for (records, 0..) |r, ri| {
         try w.writeAll("  {");
-        inline for (@typeInfo(Record).@"struct".fields, 0..) |f, i| {
+        inline for (info.field_names, info.field_types, 0..) |name, ftype, i| {
             if (i != 0) try w.writeAll(", ");
-            const v = @field(r, f.name);
-            switch (@typeInfo(f.type)) {
-                .pointer => try w.print("\"{s}\": \"{s}\"", .{ f.name, v }),
-                .float => try w.print("\"{s}\": {d:.4}", .{ f.name, finite(v) }),
-                else => try w.print("\"{s}\": {d}", .{ f.name, v }),
+            const v = @field(r, name);
+            switch (@typeInfo(ftype)) {
+                .pointer => try w.print("\"{s}\": \"{s}\"", .{ name, v }),
+                .float => try w.print("\"{s}\": {d:.4}", .{ name, finite(v) }),
+                else => try w.print("\"{s}\": {d}", .{ name, v }),
             }
         }
         try w.writeAll(if (ri + 1 == records.len) "}\n" else "},\n");
@@ -1387,20 +1389,22 @@ fn parseCsv(arena: Allocator, text: []const u8) ![]Record {
     var lines = std.mem.tokenizeAny(u8, text, "\r\n");
     const header = lines.next() orelse return error.EmptyBaseline;
 
-    const fields = @typeInfo(Record).@"struct".fields;
-    var col: [fields.len]?usize = @splat(null);
+    const info = @typeInfo(Record).@"struct";
+    const names = info.field_names;
+    const types = info.field_types;
+    var col: [names.len]?usize = @splat(null);
 
     var hi: usize = 0;
     var hit = std.mem.splitScalar(u8, header, ',');
     while (hit.next()) |h| : (hi += 1) {
         const name = std.mem.trim(u8, h, " ");
-        inline for (fields, 0..) |f, fi| {
-            if (eql(name, f.name)) col[fi] = hi;
+        inline for (names, 0..) |fname, fi| {
+            if (eql(name, fname)) col[fi] = hi;
         }
     }
 
     var out: std.ArrayList(Record) = .empty;
-    var cells: [fields.len * 2][]const u8 = undefined;
+    var cells: [names.len * 2][]const u8 = undefined;
     while (lines.next()) |line| {
         if (std.mem.trim(u8, line, " ").len == 0) continue;
         var n: usize = 0;
@@ -1411,12 +1415,12 @@ fn parseCsv(arena: Allocator, text: []const u8) ![]Record {
         }
 
         var r: Record = undefined;
-        inline for (fields, 0..) |f, fi| {
+        inline for (names, types, 0..) |fname, ftype, fi| {
             const raw: ?[]const u8 = if (col[fi]) |ci| (if (ci < n) cells[ci] else null) else null;
-            @field(r, f.name) = switch (@typeInfo(f.type)) {
+            @field(r, fname) = switch (@typeInfo(ftype)) {
                 .pointer => raw orelse "",
                 .float => if (raw) |s| (std.fmt.parseFloat(f64, s) catch 0) else 0,
-                else => if (raw) |s| (std.fmt.parseInt(f.type, s, 10) catch 0) else 0,
+                else => if (raw) |s| (std.fmt.parseInt(ftype, s, 10) catch 0) else 0,
             };
         }
         try out.append(arena, r);
@@ -1579,7 +1583,7 @@ pub fn main(init: std.process.Init) !void {
                 total_points, o.trials, o.execute,
             });
         }
-        if (builtin.mode != .ReleaseFast and builtin.mode != .ReleaseSafe)
+        if (builtin.mode != .fast and builtin.mode != .safe)
             try log.writeAll("warning: not an optimized build; numbers are meaningless\n");
         try log.flush();
     }
@@ -1782,8 +1786,9 @@ test "records survive a csv round trip" {
     const arena = arena_state.allocator();
 
     var before: Record = undefined;
-    inline for (@typeInfo(Record).@"struct".fields) |f| {
-        @field(before, f.name) = switch (@typeInfo(f.type)) {
+    const info = @typeInfo(Record).@"struct";
+    inline for (info.field_names, info.field_types) |name, ftype| {
+        @field(before, name) = switch (@typeInfo(ftype)) {
             .pointer => "x",
             .float => 1.5,
             else => 7,

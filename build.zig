@@ -19,8 +19,8 @@ pub fn build(b: *std.Build) void {
     const bench_optimize = b.option(
         std.builtin.OptimizeMode,
         "bench-optimize",
-        "optimize mode for the benchmarks and the copy of zstm they measure (default: ReleaseFast)",
-    ) orelse .ReleaseFast;
+        "optimize mode for the benchmarks and the copy of zstm they measure (default: fast)",
+    ) orelse .fast;
 
     const zstm_measured = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
     // result is cached and skip the run.
     bench_run.has_side_effects = true;
     bench_run.stdio = .inherit;
-    if (b.args) |args| bench_run.addArgs(args);
+    bench_run.addPassthruArgs();
 
     const bench_step = b.step("bench", "run the benchmarks (pass options after --)");
     bench_step.dependOn(&bench_run.step);
@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
 
     // built separately from `bench_mod`: these check the driver's statistics
-    // and csv handling, which want safety checks on rather than ReleaseFast.
+    // and csv handling, which want safety checks on rather than fast.
     const bench_test_mod = b.createModule(.{
         .root_source_file = b.path("src/bench/main.zig"),
         .target = target,
