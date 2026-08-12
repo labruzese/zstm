@@ -9,6 +9,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const zstm_check = b.addExecutable(.{
+        .name = "zstm",
+        .root_module = zstm,
+    });
+    const check = b.step("check", "Check if zstm compiles");
+    check.dependOn(&zstm_check.step);
 
     const bench_optimize = b.option(
         std.builtin.OptimizeMode,

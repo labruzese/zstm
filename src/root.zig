@@ -528,17 +528,15 @@ pub const Tx = struct {
 
         // Acquire the commit lock. On a failed CAS, validate (which advances
         // our snapshot past the conflicting writer) and retry.
-        while (true) {
-            if (self.stm.seq_lock.cmpxchgStrong(
-                self.snapshot,
-                self.snapshot + 1,
-                .acq_rel,
-                .monotonic,
-            )) |_| {
-                // Some other writer committed; revalidate and try again.
-                self.snapshot = try self.validate();
-            } else break;
-        }
+        if (self.stm.seq_lock.cmpxchgStrong(
+            self.snapshot,
+            self.snapshot + 1,
+            .acq_rel,
+            .monotonic,
+        )) |_| {
+            // Some other writer committed / is committing;
+            try self.acquireContended();
+        } 
 
         // We hold the lock (it now reads `snapshot + 1`, an odd value). Any
         // concurrent transaction will spin in `txBegin` or in `validate`'s
@@ -552,6 +550,71 @@ pub const Tx = struct {
         // visible to any subsequent `acquire` load by another transaction.
         self.stm.seq_lock.store(self.snapshot + 2, .release);
         self.snapshot = self.snapshot + 2;
+    }
+
+    inline fn rdtsc() u64 {
+        return asm volatile (
+            \\ rdtsc
+            \\ shl $32,%%rdx
+            \\ or %%rdx,%%rax
+            : [ret] "={rax}" (-> u64) :: .{ .rdx = true });
+    }
+
+    // do not optimize for this case
+    noinline fn acquireContended(self: *Tx) Error!void {
+        var attempt: u32 = 0;
+        while (true) {
+            const now = self.stm.seq_lock.load(.monotonic);
+
+            if (now & 1 != 0) {
+                // bounded: do NOT back off
+                self.waitWhileHeld(); 
+                continue;
+            }
+            if (now != self.snapshot) {
+                // maybe abort
+                self.snapshot = try self.validate();
+                continue;
+            }
+            if (self.stm.seq_lock.cmpxchgStrong(
+                self.snapshot, self.snapshot + 1, .acq_rel, .monotonic,
+            ) == null) return;
+
+            // lost a real race, losing threads backoff
+            self.backoffOnce(attempt);
+            attempt +|= 1;
+        }
+    }
+
+    fn waitWhileHeld(self: *Tx) void {
+        // assume holder was descheduled after 16384 cycles. 
+        // although it's also possible that they committed, we descheduled, someone else grabbed lock repeat.
+        // we are busy waiting on commit though so if we get descheduled us and someone else needed this core 
+        // so yielding is ok.
+        const preempt_ticks = 0x4000; 
+        const expire = preempt_ticks + rdtsc();
+        while (rdtsc() < expire) { // bounded spin
+            if (self.stm.seq_lock.load(.monotonic) & 1 == 0) return;
+            std.atomic.spinLoopHint();
+        }
+        while (self.stm.seq_lock.load(.monotonic) & 1 != 0) {
+            std.Thread.yield() catch {}; 
+        }
+    }
+
+    fn backoffOnce(self: *Tx, attempt: u32) void {
+        // assume: 2 cycles per writeback
+        // assume: other txn has similarly sized write set
+        const want: u64 = @max(64, self.writes.count() *| 2);              // spin min of 64 cycles
+        const floor = @as(u64, 1) << @intCast(64 - @clz(want - 1));        // up to nearest power of two
+        const budget = @min(floor << @intCast(@min(attempt, 8)), 0x4000);  // spin max of 16384 cycles
+        const half = budget / 2;
+        const mixed = (@intFromPtr(self) ^ attempt) *% 0x9E3779B97F4A7C15;
+        const jitter = (mixed >> 32) & (half - 1);                         // mixed upper bits cause ptr alignment
+        const target = rdtsc() +% half +% jitter;
+        while (rdtsc() < target) {
+            std.atomic.spinLoopHint();
+        }
     }
 
     /// Reset transaction-local state. Call after a `TxRetry` (or any other)
