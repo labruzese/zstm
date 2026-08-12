@@ -95,7 +95,7 @@ pub fn TxCell(comptime T: type) type {
 
         pub fn init(value: T) @This() {
             var self: @This() = undefined;
-            var words_copy = [_]Word{0} ** word_count;
+            var words_copy = @as([]Word, @splat(word_count));
             
             const value_bytes = std.mem.asBytes(&value);
             const words_bytes = std.mem.sliceAsBytes(&words_copy);
@@ -126,7 +126,7 @@ pub fn TxCell(comptime T: type) type {
 
         /// Non-transactional store. Same tearing caveats as `unsafeLoad`.
         pub fn unsafeStore(self: *@This(), value: T) void {
-            var words_copy = [_]Word{0} ** word_count;
+            var words_copy = @as([]Word, @splat(0)) ;
             const value_bytes = std.mem.asBytes(&value);
             const words_bytes = std.mem.sliceAsBytes(&words_copy);
             @memcpy(words_bytes[0..value_bytes.len], value_bytes);
@@ -686,7 +686,7 @@ pub const Tx = struct {
         const T = CellType.Payload;
         if (@TypeOf(value) != T) @compileError("type mismatch in writeCell");
 
-        var words_copy = [_]Word{0} ** CellType.NumWords;
+        var words_copy = @as([]Word, @splat(CellType.NumWords));
         const value_bytes = std.mem.asBytes(&value);
         const words_bytes = std.mem.sliceAsBytes(&words_copy);
         @memcpy(words_bytes[0..value_bytes.len], value_bytes);
