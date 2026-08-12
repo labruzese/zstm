@@ -479,14 +479,13 @@ const RunCtx = struct {
     /// 0 = latency sampling off.
     sample_stride: u32,
     pin: bool,
-    ncpu: u32,
     stats: []ThreadStats,
 };
 
 fn Worker(comptime W: type) type {
     return struct {
         fn run(ctx: *RunCtx, id: u32) void {
-            if (ctx.pin) pinToCpu(id % ctx.ncpu);
+            if (ctx.pin) pinToCpu(id);
 
             // A private arena per thread: the read log and write set never
             // contend on a shared allocator, and the whole lot is freed at once.
@@ -685,12 +684,54 @@ fn calibrateTimer() u64 {
     return samples[samples.len / 2];
 }
 
-fn pinToCpu(cpu: u32) void {
+/// CPU *ids* this process inherited permission to run on, ascending.
+///
+/// Not to be confused with `cpuCount()`, which is the *number* of such ids.
+/// Under `taskset -c 1,3,5,7` the count is 4 but the ids are 1,3,5,7, and
+/// pinning a worker to "CPU 3" because it is the fourth worker lands it
+/// somewhere the caller never asked for.
+var allowed_cpus: []const u16 = &.{};
+var allowed_cpus_buf: [@typeInfo(linux.cpu_set_t).array.len * @bitSizeOf(usize)]u16 = undefined;
+
+/// Snapshot the inherited affinity mask. Must run before any worker pins
+/// itself: `sched_setaffinity` *replaces* a thread's mask rather than
+/// intersecting it with what the process was granted, so the first `pinToCpu`
+/// would otherwise destroy the evidence of what `taskset` handed us.
+fn initAllowedCpus() void {
+    var set: linux.cpu_set_t = @splat(0);
+    if (linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &set) != 0) return;
+
+    const bits = @bitSizeOf(usize);
+    var n: usize = 0;
+    for (set, 0..) |word, w| {
+        var b: usize = 0;
+        while (b < bits) : (b += 1) {
+            if (word & (@as(usize, 1) << @intCast(b)) != 0) {
+                allowed_cpus_buf[n] = @intCast(w * bits + b);
+                n += 1;
+            }
+        }
+    }
+    allowed_cpus = allowed_cpus_buf[0..n];
+}
+
+/// Set when a worker's `sched_setaffinity` did not take effect, so that a run
+/// which silently failed to pin cannot be mistaken for a pinned one.
+var pin_failed: std.atomic.Value(bool) = .init(false);
+
+/// Pin the calling thread to the `slot`-th CPU of the inherited mask, wrapping
+/// when there are more workers than CPUs.
+fn pinToCpu(slot: u32) void {
+    if (allowed_cpus.len == 0) {
+        pin_failed.store(true, .monotonic);
+        return;
+    }
+    const cpu = allowed_cpus[slot % allowed_cpus.len];
+
     var set: linux.cpu_set_t = @splat(0);
     const bits = @bitSizeOf(usize);
-    if (cpu / bits >= set.len) return;
     set[cpu / bits] = @as(usize, 1) << @intCast(cpu % bits);
-    linux.sched_setaffinity(0, &set) catch {};
+    linux.sched_setaffinity(0, &set) catch pin_failed.store(true, .monotonic);
 }
 
 /// Run one trial of `W` at `threads` threads and return the raw numbers.
@@ -746,7 +787,6 @@ fn runTrial(
         .warmup_execute = if (o.warmup_ms == 0) 0 else @max(1, o.execute / 8),
         .sample_stride = if (o.latency) o.latency_stride else 0,
         .pin = o.pin,
-        .ncpu = @max(1, cpuCount()),
         .stats = stats,
     };
 
@@ -1465,6 +1505,9 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
 
+    // Before anything can pin itself and overwrite the mask.
+    initAllowedCpus();
+
     const o = try parseArgs(arena, init.minimal.args);
 
     var out_buf: [64 * 1024]u8 = undefined;
@@ -1511,6 +1554,14 @@ pub fn main(init: std.process.Init) !void {
             cpuCount(),
             builtin.zig_version,
         });
+        if (o.pin) {
+            // Printed because the ids, not the count, are what pinning uses:
+            // if this line disagrees with the `taskset` you typed, the run is
+            // not measuring the cores you selected.
+            try log.writeAll("pinning worker i -> cpu");
+            for (allowed_cpus, 0..) |c, i| try log.print("{s}{d}", .{ if (i == 0) " " else ",", c });
+            try log.writeAll("\n");
+        }
         if (o.execute == 0) {
             try log.print(
                 "{d} points x {d} trials x ({d}ms warmup + {d}ms) = {d}s under the clock," ++
@@ -1603,6 +1654,11 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         }
+    }
+
+    if (o.pin and pin_failed.load(.monotonic)) {
+        try log.writeAll("warning: --pin: sched_setaffinity failed; workers ran unpinned\n");
+        try log.flush();
     }
 
     switch (o.format) {
