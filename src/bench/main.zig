@@ -191,7 +191,7 @@ const Options = struct {
     warmup_ms: u32 = 200,
     /// non-zero switches from timed runs to a fixed transaction count per thread.
     execute: u32 = 0,
-    modes: []const zstm.Tx.Mode = &.{.ala},
+    comptime modes: []const zstm.Tx.PubSafety = &.{zstm.build_options.zstm_pub_safety},
     latency: bool = true,
     latency_stride: u32 = 64,
     format: Format = .table,
@@ -216,7 +216,6 @@ const usage =
     \\  --only  <a,b,...>      run only benchmarks whose name contains one of these
     \\  --skip  <a,b,...>      skip benchmarks whose name contains one of these
     \\  --threads <1,2,4,...>  thread counts to sweep (default: powers of 2 up to nproc)
-    \\  --mode  <ala|sla|both> publication-safety mode(s) to measure (default: ala)
     \\
     \\Measurement
     \\  --trials <n>           repetitions per point, for noise estimation (default: 5)
@@ -291,15 +290,6 @@ fn parseArgs(arena: Allocator, args: std.process.Args) !Options {
             o.warmup_ms = parseU32(next(&it, inline_value, key));
         } else if (eql(key, "--execute")) {
             o.execute = parseU32(next(&it, inline_value, key));
-        } else if (eql(key, "--mode")) {
-            const v = next(&it, inline_value, key);
-            if (eql(v, "ala")) {
-                o.modes = &.{.ala};
-            } else if (eql(v, "sla")) {
-                o.modes = &.{.sla};
-            } else if (eql(v, "both") or eql(v, "ala,sla")) {
-                o.modes = &.{ .ala, .sla };
-            } else fatal("unknown --mode '{s}' (want ala, sla or both)", .{v});
         } else if (eql(key, "--latency")) {
             o.latency = true;
         } else if (eql(key, "--no-latency")) {
@@ -472,7 +462,7 @@ const Barrier = struct {
 const RunCtx = struct {
     barrier: Barrier,
     running: std.atomic.Value(bool) align(cache_line) = .init(true),
-    mode: zstm.Tx.Mode,
+    comptime mode: zstm.Tx.PubSafety = zstm.build_options.zstm_pub_safety,
     /// 0 = timed run; otherwise transactions per thread.
     execute: u32,
     warmup_execute: u32,
@@ -742,7 +732,7 @@ fn runTrial(
     o: Options,
     p: Params,
     threads: u32,
-    mode: zstm.Tx.Mode,
+    comptime mode: zstm.Tx.PubSafety,
 ) !Trial {
     // Fresh library state so the sequence lock counts only this trial, and so
     // workloads that assert on it (Counter) see a clean slate.
@@ -758,7 +748,6 @@ fn runTrial(
         .inspct = p.inspct,
         .sets = p.sets,
         .ops = p.ops,
-        .mode = mode,
     };
 
     // Workload data is rebuilt per trial; the warm-up phase absorbs the
@@ -964,7 +953,7 @@ fn stddev(xs: []const f64) f64 {
 
 fn summarize(
     name: []const u8,
-    mode: zstm.Tx.Mode,
+    mode: zstm.Tx.PubSafety,
     threads: u32,
     o: Options,
     p: Params,
@@ -1599,7 +1588,7 @@ pub fn main(init: std.process.Init) !void {
             const params = applyOverrides(b.params, o);
             const sweep = threadSweep(b, o, default_threads);
 
-            for (o.modes) |mode| {
+            inline for (o.modes) |mode| {
                 var single_thread_tps: f64 = 0;
                 for (sweep) |threads| {
                     checkLimits(b, params, threads);

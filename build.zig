@@ -1,14 +1,30 @@
 const std = @import("std");
 
+const PubSafety = enum {
+    ala,
+    sla,
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const zstm_pub_safety = b.option(
+        PubSafety,
+        "zstm_pub_safety",
+        "Select the publication mode [ala (default), sla]",
+    ) orelse .ala;
+
+    const options = b.addOptions();
+    options.addOption(PubSafety, "zstm_pub_safety", zstm_pub_safety);
 
     const zstm = b.addModule("zstm", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    zstm.addOptions("build_options", options);
+
     const zstm_check = b.addExecutable(.{
         .name = "zstm",
         .root_module = zstm,
@@ -27,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = bench_optimize,
     });
+    zstm_measured.addOptions("build_options", options);
 
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench/main.zig"),

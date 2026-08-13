@@ -43,9 +43,6 @@ pub const Config = struct {
     // calls a workload's `verify`, which is the only thing that reads them.
     txcount: std.atomic.Value(u32) = .init(0),
     aborts: std.atomic.Value(u64) = .init(0),
-
-    /// Selected via `--mode`; controls zstm's publication-safety mode.
-    mode: zstm.Tx.Mode = .ala,
 };
 
 pub var cfg: Config = .{};

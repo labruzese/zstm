@@ -48,6 +48,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
+pub const build_options = @import("build_options"); // what zstm was requiested to be built with you can still override this with a comptime
 
 pub const Word = usize;
 
@@ -431,29 +432,25 @@ pub const Tx = struct {
     /// the transaction has decided to write. 
     writes: WriteSet = .empty,
 
-    /// SLA mode adds an unconditional validation at commit time so that
-    /// publication via an empty (or read-only) transaction is detected. 
-    /// ALA mode is the default and is sufficient for any program in which 
-    /// publication is via a forward dependence, or for programs without 
-    /// source-level data races.
-    sla: bool = false,
-
     /// Selects the ordering semantics the transaction should provide.
     ///
     /// Use `.ala` (the default) unless you specifically need the stronger
     /// guarantee. SLA costs an extra read-set walk on every commit, including
     /// read-only commits, but is required for full single-lock-atomicity
     /// equivalence in programs with racy publication.
-    pub const Mode = enum { ala, sla };
+    comptime mode: PubSafety = build_options.zstm_pub_safety,
+    pub const PubSafety = @TypeOf(build_options.zstm_pub_safety);
 
     /// Construct a transaction context. The allocator is used for the read
     /// log and write set; pass a long-lived per-thread allocator for best
     /// performance.
-    pub fn init(allocator: Allocator, stm: *Stm, mode: Mode) Tx {
+    ///
+    /// mode: override the publication mode for this transaction. Default is set by -Dzstm_pub_safety which defaults to ALA
+    pub fn init(allocator: Allocator, stm: *Stm, comptime mode: ?PubSafety) Tx {
         return .{
             .stm = stm,
             .allocator = allocator,
-            .sla = mode == .sla,
+            .mode = mode orelse build_options.zstm_pub_safety,
         };
     }
 
@@ -518,11 +515,11 @@ pub const Tx = struct {
     pub fn txCommit(self: *Tx) Error!void {
         // Read-only fast path.
         if (self.writes.count() == 0) {
-            if (self.sla) {
+            comptime if (self.mode == .sla) {
                 // SLA: validate once even on read-only, so that empty/read-only
                 // transactions can serve as publication points.
                 _ = try self.validate();
-            }
+            };
             return;
         }
 
