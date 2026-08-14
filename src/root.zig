@@ -4,7 +4,7 @@
 //! Spear, and Scott
 //! (PPoPP'10, "NOrec: Streamlining STM by Abolishing Ownership Records").
 //!
-//! NOrec is a low-overhead STM that combines the following ideas:
+//! NOrec combines the following ideas:
 //!
 //!   1. A single global sequence lock 
 //!   2. A redo log 
