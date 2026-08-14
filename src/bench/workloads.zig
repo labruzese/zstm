@@ -1,9 +1,7 @@
-//! Zig ports of four RSTM v7 microbenchmarks, written against zstm.
+//! Zig ports of RSTM v7 microbenchmarks
 //!
 //! Each is a line-for-line translation of its C++ counterpart in
-//! rstm/bench/. Where the original does something surprising, the surprise is
-//! reproduced rather than corrected -- the goal is for both implementations to
-//! execute the same workload, not for the workload to be good.
+//! rstm/bench/.
 
 const std = @import("std");
 const zstm = @import("zstm");
@@ -12,13 +10,11 @@ const harness = @import("harness.zig");
 const TxWord = zstm.TxWord;
 const Word = zstm.Word;
 
-// ---------------------------------------------------------------------------
-// CounterBench -- rstm/bench/CounterBench.cpp
+// CounterBench -- from rstm/bench/CounterBench.cpp
 //
 // One shared word, incremented by every transaction. Maximum contention: every
 // pair of concurrent transactions conflicts, so this measures commit-path cost
 // and abort behavior rather than throughput of useful work.
-// ---------------------------------------------------------------------------
 pub const Counter = struct {
     harness: *harness.Harness,
 
@@ -70,13 +66,11 @@ pub const Counter = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
 // ReadNWrite1Bench -- rstm/bench/ReadNWrite1Bench.cpp
 //
 // `-O` random reads from an `-m`-element array, then a single write to the last
 // location read. Read-mostly: the read log grows to O entries while the write
 // set holds exactly one.
-// ---------------------------------------------------------------------------
 pub const ReadNWrite1 = struct {
     harness: *harness.Harness,
 
@@ -129,12 +123,10 @@ pub const ReadNWrite1 = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
 // ReadWriteNBench -- rstm/bench/ReadWriteNBench.cpp
 //
 // `-O` random reads, then `-O` writes back to those same slots. Write-heavy:
 // exercises the write-set insert path and the commit-time writeback loop.
-// ---------------------------------------------------------------------------
 pub const ReadWriteN = struct {
     harness: *harness.Harness,
 
@@ -188,7 +180,6 @@ pub const ReadWriteN = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
 // DisjointBench -- rstm/bench/DisjointBench.cpp + rstm/bench/Disjoint.hpp
 //
 // Every thread works in its own cache-line-padded 1009-entry buffer, so
@@ -200,7 +191,6 @@ pub const ReadWriteN = struct {
 //   prefix  PrDw = private read buffer, SrDw = shared read buffer
 //   L       locations touched per transaction
 //   R, W    reads and writes per ten operations
-// ---------------------------------------------------------------------------
 pub const Disjoint = struct {
     harness: *harness.Harness,
 

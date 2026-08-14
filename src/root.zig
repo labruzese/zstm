@@ -15,14 +15,13 @@
 //!   - **Livelock freedom.**
 //!   - **Privatization safety.**
 //!   - **Publication safety (ALA by default, optional SLA).** SLA requires 
-//!     one extra validation at commit time and is selectable via `Tx.Mode`.
+//!     one extra validation at commit time and is selectable via comptime `Tx.PubSafety`.
 //!   - **Opacity.** A doomed transaction never observes inconsistent state.
 //!
-//! Properties this implementation does NOT (yet) provide:
+//! Properties this implementation does NOT provide:
 //!
-//!   - Closed nesting.
-//!   - Inevitable / irrevocable transactions.
-//!   - Hybrid HTM/STM integration.
+//!   - Transaction nesting
+//!   - Hardware integration
 //!   - Memory reclamation safety for transactionally freed pointers.
 //!
 //! ## Usage
@@ -48,7 +47,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
-pub const build_options = @import("build_options"); // what zstm was requiested to be built with you can still override this with a comptime
+pub const build_options = @import("build_options"); 
 
 pub const Word = usize;
 
@@ -513,105 +512,37 @@ pub const Tx = struct {
     /// Attempt to commit the transaction. Returns `error.TxRetry` if the
     /// transaction was invalidated by a concurrent writer.
     pub fn txCommit(self: *Tx) Error!void {
-        // Read-only fast path.
-        if (self.writes.count() == 0) {
-            comptime if (self.mode == .sla) {
-                // SLA: validate once even on read-only, so that empty/read-only
-                // transactions can serve as publication points.
-                _ = try self.validate();
-            };
-            return;
+        comptime if (self.mode == .ala) {
+            // in ala read-only doesn't serve as a publication point we can skip revalidation
+            if (self.writes.count() == 0) {
+                return;
+            }
+        };
+
+        // Acquire the commit lock, moving seq_lock to odd indicating inconsistant state. 
+        while (self.stm.seq_lock.cmpxchgStrong(self.snapshot, self.snapshot + 1, .acq_rel, .monotonic)) |new_time| {
+            if (new_time & 1 == 0) {
+                // time is consistant: validate and try again with new snapshot
+                for (self.reads.items) |entry| {
+                    if (@atomicLoad(Word, &entry.addr.raw, .monotonic) != entry.val)
+                        return error.TxRetry;
+                }
+                self.snapshot = new_time;
+            } else {
+                // another writer is committing, wait for them to finish
+                while(self.stm.seq_lock.load(.monotonic) == new_time) {
+                    std.atomic.spinLoopHint();
+                }
+            }
         }
 
-        // Acquire the commit lock. On a failed CAS, validate (which advances
-        // our snapshot past the conflicting writer) and retry.
-        if (self.stm.seq_lock.cmpxchgStrong(
-            self.snapshot,
-            self.snapshot + 1,
-            .acq_rel,
-            .monotonic,
-        )) |_| {
-            // Some other writer committed / is committing;
-            try self.acquireContended();
-        } 
-
-        // We hold the lock (it now reads `snapshot + 1`, an odd value). Any
-        // concurrent transaction will spin in `txBegin` or in `validate`'s
-        // odd-value check.
         for (self.writes.items()) |entry| {
-                @atomicStore(Word, &entry.addr.raw, entry.val, .monotonic);
+            @atomicStore(Word, &entry.addr.raw, entry.val, .monotonic);
         }
 
-        // Release the lock with a fresh even value, one greater than what we
-        // CAS'd in. The `release` ordering ensures all writeback stores are
-        // visible to any subsequent `acquire` load by another transaction.
+        // Release the commit lock by moving to even time again
         self.stm.seq_lock.store(self.snapshot + 2, .release);
-        self.snapshot = self.snapshot + 2;
-    }
-
-    inline fn rdtsc() u64 {
-        return asm volatile (
-            \\ rdtsc
-            \\ shl $32,%%rdx
-            \\ or %%rdx,%%rax
-            : [ret] "={rax}" (-> u64) :: .{ .rdx = true });
-    }
-
-    // do not optimize for this case
-    noinline fn acquireContended(self: *Tx) Error!void {
-        var attempt: u32 = 0;
-        while (true) {
-            const now = self.stm.seq_lock.load(.monotonic);
-
-            if (now & 1 != 0) {
-                // bounded: do NOT back off
-                self.waitWhileHeld(); 
-                continue;
-            }
-            if (now != self.snapshot) {
-                // maybe abort
-                self.snapshot = try self.validate();
-                continue;
-            }
-            if (self.stm.seq_lock.cmpxchgStrong(
-                self.snapshot, self.snapshot + 1, .acq_rel, .monotonic,
-            ) == null) return;
-
-            // lost a real race, losing threads backoff
-            self.backoffOnce(attempt);
-            attempt +|= 1;
-        }
-    }
-
-    fn waitWhileHeld(self: *Tx) void {
-        // assume holder was descheduled after 16384 cycles. 
-        // although it's also possible that they committed, we descheduled, someone else grabbed lock repeat.
-        // we are busy waiting on commit though so if we get descheduled us and someone else needed this core 
-        // so yielding is ok.
-        const preempt_ticks = 0x4000; 
-        const expire = preempt_ticks + rdtsc();
-        while (rdtsc() < expire) { // bounded spin
-            if (self.stm.seq_lock.load(.monotonic) & 1 == 0) return;
-            std.atomic.spinLoopHint();
-        }
-        while (self.stm.seq_lock.load(.monotonic) & 1 != 0) {
-            std.Thread.yield() catch {}; 
-        }
-    }
-
-    fn backoffOnce(self: *Tx, attempt: u32) void {
-        // assume: 2 cycles per writeback
-        // assume: other txn has similarly sized write set
-        const want: u64 = @max(64, self.writes.count() *| 2);              // spin min of 64 cycles
-        const floor = @as(u64, 1) << @intCast(64 - @clz(want - 1));        // up to nearest power of two
-        const budget = @min(floor << @intCast(@min(attempt, 8)), 0x4000);  // spin max of 16384 cycles
-        const half = budget / 2;
-        const mixed = (@intFromPtr(self) ^ attempt) *% 0x9E3779B97F4A7C15;
-        const jitter = (mixed >> 32) & (half - 1);                         // mixed upper bits cause ptr alignment
-        const target = rdtsc() +% half +% jitter;
-        while (rdtsc() < target) {
-            std.atomic.spinLoopHint();
-        }
+        self.snapshot += 2;
     }
 
     /// Reset transaction-local state. Call after a `TxRetry` (or any other)
@@ -639,11 +570,14 @@ pub const Tx = struct {
         var val = @atomicLoad(Word, &addr.raw, .monotonic);
 
         // If the global lock has advanced, we may have read a value that is 
-        // inconsistent with our earlier reads; re-validate and re-read 
-        // until we get a consistent value or abort.
+        // inconsistent with our earlier reads; fast forward until we get a consistent value or abort.
         while (self.snapshot != self.stm.seq_lock.load(.acquire)) {
-            self.snapshot = try self.validate();
+            for (self.reads.items) |entry| {
+                if (@atomicLoad(Word, &entry.addr.raw, .monotonic) != entry.val)
+                    return error.TxRetry;
+            }
             val = @atomicLoad(Word, &addr.raw, .monotonic);
+            self.snapshot = 
         }
 
         try self.reads.append(self.allocator, .{ .addr = addr, .val = val });
@@ -693,34 +627,12 @@ pub const Tx = struct {
         }
     }
 
-    /// Run a consistent-snapshot validation of the read log. Returns the
-    /// timestamp at which validation succeeded (suitable as the new snapshot)
-    /// or `error.TxRetry` if any logged value has changed.
-    fn validate(self: *Tx) Error!u64 {
-        while (true) {
-            const time = self.stm.seq_lock.load(.acquire);
-            if (time & 1 != 0) {
-                // A writer is currently mid-commit. Spin until it finishes;
-                // we cannot meaningfully validate against an in-progress
-                // writer's reads.
-                std.atomic.spinLoopHint();
-                continue;
-            }
-
-            // Walk the read log, checking each location still holds the value
-            // we originally saw. Any mismatch means the transaction is doomed.
-            for (self.reads.items) |entry| {
-                if (@atomicLoad(Word, &entry.addr.raw, .monotonic) != entry.val)
-                    return error.TxRetry;
-            }
-
-            // If the lock did not advance during our scan, the snapshot we
-            // started with is a valid consistent snapshot.
-            if (self.stm.seq_lock.load(.acquire) == time) return time;
-
-            // Otherwise a writer slipped in; restart the scan with the newer
-            // snapshot. 
-        }
+    /// Run a consistent-snapshot validation of the read log. 
+    /// This errors with TxRetry if one of our reads has been written to
+    inline fn validate(self: *Tx) Error!bool {
+        // Walk the read log, checking each location still holds the value
+        // we originally saw. Any mismatch means the transaction is doomed.
+        
     }
 };
 
